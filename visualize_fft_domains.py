@@ -1,32 +1,29 @@
 # ==============================================================
 #  visualize_fft_domains.py
 #
-#  Visualises the low-frequency FFT amplitude of CASIA-MS and XJTU
-#  palmprint images to reveal domain separability across spectral bands.
+#  Visualises FFT-based domain separability for CASIA-MS and XJTU
+#  palmprint datasets. Answers the question: "do images from different
+#  spectral domains / devices look different in the frequency domain?"
 #
-#  Each image → Gaussian-masked FFT amplitude vector → 2D projection.
-#  Points coloured by domain (spectrum or device/lighting condition).
+#  Three descriptor modes:
+#    "radial"      — log(1+|FFT|) → radial ring means (best separation)
+#    "raw"         — raw |FFT| flattened (baseline, very high-dim)
+#    "sensorprint" — residual FFT + whitening + band ratios (forensic)
 #
-#  Projections:
-#    1. PCA  — fast linear projection (good for global structure)
-#    2. t-SNE — non-linear, preserves local clusters
-#    3. UMAP  — non-linear, preserves both local and global structure
+#  Five outputs per run (saved to OUT_DIR):
+#    1. fft_scatter_*    — PCA / t-SNE / UMAP scatter (each point = 1 image)
+#    2. fft_heatmaps_*   — mean FFT amplitude per domain (shows spectral shape)
+#    3. fft_distances_*  — pairwise cosine distance matrix between domains
+#    4. fft_radial_*     — mean radial spectral profile curves per domain
+#    5. clf_confusion_*  — confusion matrix from domain classifier (SVM/NN)
 #
-#  Also produces:
-#    4. Mean amplitude heatmaps per domain
-#    5. Pairwise domain distance matrix (cosine distance on mean descriptors)
+#  All parameters are set as variables at the top of __main__ — no CLI needed.
 #
-#  Usage:
-#    python visualize_fft_domains.py --dataset casiams
-#    python visualize_fft_domains.py --dataset xjtu
-#    python visualize_fft_domains.py --dataset casiams --beta 0.05
-#    python visualize_fft_domains.py --dataset casiams --max_per_domain 100
-#
-#  Requirements: pip install scikit-learn matplotlib umap-learn
+#  Requirements: pip install scikit-learn matplotlib umap-learn scipy
 # ==============================================================
 
+
 import os
-import argparse
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -573,74 +570,172 @@ def plot_projections(descriptors, domain_labels_list, domains, methods,
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset",        default="casiams",
-                   choices=["casiams", "xjtu"],
-                   help="dataset to visualise")
-    p.add_argument("--data_root",      default=None,
-                   help="path to dataset root (default: hardcoded CASIAMS_ROOT / XJTU_ROOT)")
-    p.add_argument("--beta",           type=float, default=0.4,
-                   help="hard mask radius as fraction of image size")
-    p.add_argument("--n_bins",         type=int,   default=64,
-                   help="number of radial profile bins (radial mode only)")
-    p.add_argument("--desc_mode",      default="radial",
-                   choices=["radial", "raw", "sensorprint"],
-                   help=("radial=log+radial profile (best PCA separation); "
-                         "raw=flat masked amplitude (baseline); "
-                         "sensorprint=residual+whitening+band_ratios"))
-    p.add_argument("--alpha",          type=float, default=1.0,
-                   help="whitening exponent for sensorprint mode (1/f^alpha, default=1.0)")
-    p.add_argument("--classifier",     default="svm",
-                   choices=["svm", "nn", "both"],
-                   help="domain classifier: svm | nn | both")
-    p.add_argument("--img_side",       type=int,   default=128)
-    p.add_argument("--max_per_domain", type=int,   default=None,
-                   help="max images per domain (None = all)")
-    p.add_argument("--method",         nargs="+",
-                   default=["pca", "tsne", "umap"],
-                   choices=["pca", "tsne", "umap"])
-    p.add_argument("--no_umap",        action="store_true")
-    p.add_argument("--out_dir",        default="./plots")
-    p.add_argument("--seed",           type=int, default=42)
-    return p.parse_args()
-
-
 if __name__ == "__main__":
-    args = parse_args()
 
-    if args.data_root is None:
-        args.data_root = (CASIAMS_ROOT if args.dataset == "casiams"
-                          else XJTU_ROOT)
+    # ══════════════════════════════════════════════════════════
+    #  CONFIGURATION — edit these values directly
+    # ══════════════════════════════════════════════════════════
 
-    if args.no_umap and "umap" in args.method:
-        args.method = [m for m in args.method if m != "umap"]
+    # ── Dataset ────────────────────────────────────────────────
+    # "casiams" : 6 clients, one per spectral band
+    #             (460nm, 630nm, 700nm, 850nm, 940nm, WHT)
+    # "xjtu"    : 4 clients, one per (smartphone × lighting)
+    #             (iPhone/Flash, iPhone/Nature, huawei/Flash, huawei/Nature)
+    DATASET        = "casiams"
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    colors, labels_map = get_palette(args.dataset)
+    # Override data path. None → uses CASIAMS_ROOT / XJTU_ROOT at top of file.
+    DATA_ROOT      = None
+
+    # ── Descriptor mode ────────────────────────────────────────
+    # Determines what feature vector is extracted from each image's FFT.
+    # Each point in the scatter plots represents one image's descriptor.
+    # Better domain separation → domains are more distinguishable in frequency.
+    #
+    # "radial" (recommended — best PCA separation in experiments):
+    #   1. Compute |FFT(image)|, fftshift so DC is at centre
+    #   2. Apply log(1+amp) to compress dynamic range
+    #      (without log, the DC component at r=0 dominates everything)
+    #   3. Apply hard circular mask (radius = BETA × IMG_SIDE)
+    #   4. Average log-amplitude over N_BINS concentric rings
+    #   → descriptor: N_BINS-d (default 64-d)
+    #   Why it works: different wavelength sensors (460nm vs 940nm) have
+    #   different spectral decay rates — the log-radial profile captures
+    #   this rolloff, which is domain-specific but identity-independent.
+    #
+    # "raw" (baseline):
+    #   1. Compute |FFT(image)|
+    #   2. Apply hard circular mask
+    #   3. Flatten to vector
+    #   → descriptor: (2r)²-d, r = BETA×IMG_SIDE (very high-dim, ~16384-d)
+    #   Problem: no log → DC dominates; identity structure bleeds in.
+    #   Use only to confirm that "radial" actually improves over this.
+    #
+    # "sensorprint" (forensic-style sensor fingerprint):
+    #   1. residual = image − GaussianBlur(image, σ=2)
+    #      Removes low-freq palm content (identity structure).
+    #      Leaves high-freq acquisition artifacts (sensor, lens, compression).
+    #   2. amp_log = log(1 + |FFT(residual)|)
+    #   3. Whiten: amp_white = amp_log / r^ALPHA
+    #      Removes universal 1/f² natural-image prior so only device-specific
+    #      deviations from that prior remain.
+    #   4. radial_profile(amp_white × hard_mask) → N_BINS-d
+    #   5. band_energy_ratios(amp_white) → 6-d
+    #      (ratios between 5 frequency bands — normalisation-invariant)
+    #   → concat: (N_BINS+6)-d = 70-d
+    #   Best for devices/lighting (XJTU). Worse for CASIA-MS because
+    #   the residual removes the low-freq spectral rolloff that IS the
+    #   domain signal there.
+    DESC_MODE      = "radial"
+
+    # ── FFT parameters ─────────────────────────────────────────
+    # BETA: radius of the hard circular mask as a fraction of IMG_SIDE.
+    #   Larger BETA → more of the frequency spectrum included.
+    #   BETA=0.1 → inner 10% of frequencies (very low-freq only)
+    #   BETA=0.4 → inner 40% (low + mid frequencies) ← recommended
+    #   BETA=0.5 → inner 50% = entire half-spectrum
+    #   For "radial" mode, BETA affects which rings are included.
+    #   For "raw" mode, BETA determines descriptor dimension.
+    BETA           = 0.4
+
+    # N_BINS: number of concentric rings for radial profile.
+    #   More bins → finer frequency resolution but noisier at high radii.
+    #   32  → coarse, fast, less discriminative
+    #   64  → recommended balance
+    #   128 → fine-grained but slower
+    N_BINS         = 64
+
+    # ALPHA: whitening exponent for "sensorprint" mode only.
+    #   Natural images follow 1/f^alpha power law (alpha≈1 for amplitude).
+    #   Dividing by r^ALPHA removes this prior, leaving device deviations.
+    #   ALPHA=1.0 → standard amplitude whitening (recommended start)
+    #   ALPHA=0.5 → gentler whitening (keeps more low-freq signal)
+    #   ALPHA=1.5 → aggressive (emphasises high-freq device artifacts)
+    ALPHA          = 1.0
+
+    # ── Projection methods ─────────────────────────────────────
+    # Which 2D projections to compute. All three are shown side-by-side.
+    # "pca"   : fast linear projection. Good for showing global structure.
+    #           Fan/wedge shape = one dominant axis. Circular = distributed.
+    # "tsne"  : non-linear, preserves local neighbourhood. Best for seeing
+    #           whether domains form tight clusters. Slow on large datasets
+    #           (auto-subsampled to MAX_TSNE=2000 points if needed).
+    # "umap"  : non-linear, preserves both local and global structure.
+    #           Often best overall. Requires: pip install umap-learn
+    METHODS        = ["pca", "tsne", "umap"]
+
+    # Set False to skip UMAP even if umap-learn is installed.
+    # Useful if UMAP is slow or causing issues.
+    USE_UMAP       = True
+
+    # ── Domain classifier ──────────────────────────────────────
+    # Trains a domain classifier using 5-fold cross-validation.
+    # Reports accuracy + per-class metrics + confusion matrix.
+    # High accuracy → descriptor contains genuine domain information.
+    # Compare across DESC_MODE values to find the most discriminative one.
+    #
+    # "svm"  : RBF kernel SVM (C=10, gamma=scale).
+    #          Best for: small/medium datasets, nonlinear boundaries.
+    #          Scales well to 64-d or 70-d descriptors.
+    # "nn"   : MLP with 2 hidden layers (256→128 for high-dim, 128→64 otherwise).
+    #          Better for: high-dimensional "raw" descriptors (~16384-d).
+    #          Slower to train, more sensitive to feature scaling.
+    # "both" : runs both classifiers and reports both accuracies.
+    CLASSIFIER     = "svm"
+
+    # ── Sampling ───────────────────────────────────────────────
+    # MAX_PER_DOMAIN: subsample to this many images per domain.
+    #   None → use all images (CASIA-MS: ~1200 per domain, 7243 total)
+    #   100  → fast preview, 600 total — good for quick iteration
+    #   For t-SNE/UMAP: always auto-subsampled to 2000 total regardless.
+    MAX_PER_DOMAIN = None
+
+    # Input image size. Should match the FL training pipeline (128 for CompNet).
+    IMG_SIDE       = 128
+
+    # Random seed for reproducibility (PCA, t-SNE, UMAP, classifier CV).
+    SEED           = 42
+
+    # ── Output ─────────────────────────────────────────────────
+    # Directory where all figures are saved as PNG files.
+    # Output filenames include dataset name, desc_mode, and beta for traceability.
+    # Example: fft_scatter_casiams_radial_beta0.4.png
+    OUT_DIR        = "./plots"
+
+    # ══════════════════════════════════════════════════════════
+    #  END OF CONFIGURATION
+    # ══════════════════════════════════════════════════════════
+
+    # resolve data root
+    if DATA_ROOT is None:
+        DATA_ROOT = CASIAMS_ROOT if DATASET == "casiams" else XJTU_ROOT
+
+    # apply toggles
+    methods = [m for m in METHODS if m != "umap" or USE_UMAP]
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    colors, labels_map = get_palette(DATASET)
 
     print(f"\n{'='*56}")
-    print(f"  FFT Domain Visualisation — {args.dataset.upper()}")
-    print(f"  data_root      : {args.data_root}")
-    print(f"  beta           : {args.beta}")
-    print(f"  n_bins         : {args.n_bins}  (radial mode)")
-    print(f"  desc_mode      : {args.desc_mode}"
-          + (f"  alpha={args.alpha}" if args.desc_mode == "sensorprint" else ""))
-    print(f"  classifier     : {args.classifier}")
-    print(f"  img_side       : {args.img_side}")
-    print(f"  max_per_domain : {args.max_per_domain or 'all'}")
-    print(f"  methods        : {args.method}")
-    print(f"  out_dir        : {args.out_dir}")
+    print(f"  FFT Domain Visualisation — {DATASET.upper()}")
+    print(f"  data_root      : {DATA_ROOT}")
+    print(f"  desc_mode      : {DESC_MODE}"
+          + (f"  alpha={ALPHA}" if DESC_MODE == "sensorprint" else ""))
+    print(f"  beta           : {BETA}   n_bins={N_BINS}")
+    print(f"  classifier     : {CLASSIFIER}")
+    print(f"  img_side       : {IMG_SIDE}")
+    print(f"  max_per_domain : {MAX_PER_DOMAIN or 'all'}")
+    print(f"  methods        : {methods}")
+    print(f"  out_dir        : {OUT_DIR}")
     print(f"{'='*56}\n")
 
     # ── 1. Parse ───────────────────────────────────────────────
-    print(f"Parsing {args.dataset.upper()} …")
-    if args.dataset == "casiams":
-        data = parse_casia_ms(args.data_root)
+    print(f"Parsing {DATASET.upper()} …")
+    if DATASET == "casiams":
+        data = parse_casia_ms(DATA_ROOT)
     else:
-        data = parse_xjtu(args.data_root)
+        data = parse_xjtu(DATA_ROOT)
 
-    domains = (sorted(data.keys()) if args.dataset == "casiams"
+    domains = (sorted(data.keys()) if DATASET == "casiams"
                else [f"{d}/{c}" for d, c in XJTU_VARIATIONS
                      if f"{d}/{c}" in data])
     for sp in domains:
@@ -649,7 +744,7 @@ if __name__ == "__main__":
         print(f"  {sp:>18}  IDs={n_ids}  images={n_img}")
 
     # ── 2. Extract descriptors ─────────────────────────────────
-    print(f"\nExtracting FFT descriptors (β={args.beta}) …")
+    print(f"\nExtracting FFT descriptors (β={BETA}) …")
     descriptors       = []
     domain_labels_arr = []
     mean_amps         = {}
@@ -657,18 +752,18 @@ if __name__ == "__main__":
 
     for sp in domains:
         paths = [p for paths in data[sp].values() for p in paths]
-        if args.max_per_domain is not None:
-            rng   = np.random.RandomState(args.seed)
+        if MAX_PER_DOMAIN is not None:
+            rng   = np.random.RandomState(SEED)
             paths = list(rng.choice(paths,
-                                     min(args.max_per_domain, len(paths)),
+                                     min(MAX_PER_DOMAIN, len(paths)),
                                      replace=False))
         sp_descs, sp_amps = [], []
         for path in paths:
             try:
                 amp, desc = extract_descriptor(
-                path, args.img_side, args.beta,
-                n_bins=args.n_bins, mode=args.desc_mode,
-                alpha=args.alpha)
+                path, IMG_SIDE, BETA,
+                n_bins=N_BINS, mode=DESC_MODE,
+                alpha=ALPHA)
                 descriptors.append(desc)
                 domain_labels_arr.append(sp)
                 sp_descs.append(desc)
@@ -684,56 +779,56 @@ if __name__ == "__main__":
     print(f"\n  Total: {len(descriptors)} descriptors  "
           f"(dim={descriptors[0].shape[0]})")
 
-    tag = f"{args.dataset}_beta{args.beta}"
+    tag = f"{DATASET}_{DESC_MODE}_beta{BETA}"
 
     # ── 3. Scatter projections ─────────────────────────────────
     print("\nComputing projections …")
     plot_projections(
-        descriptors, domain_labels_arr, domains, args.method,
-        colors, labels_map, args.dataset, args.beta, len(descriptors),
-        out_path=os.path.join(args.out_dir, f"fft_scatter_{tag}.png"),
-        seed=args.seed)
+        descriptors, domain_labels_arr, domains, methods,
+        colors, labels_map, DATASET, BETA, len(descriptors),
+        out_path=os.path.join(OUT_DIR, f"fft_scatter_{tag}.png"),
+        seed=SEED)
 
     # ── 4. Mean amplitude heatmaps ────────────────────────────
     print("\nPlotting mean amplitude heatmaps …")
     plot_mean_heatmaps(
-        mean_amps, domains, args.img_side, args.beta,
+        mean_amps, domains, IMG_SIDE, BETA,
         colors, labels_map,
-        out_path=os.path.join(args.out_dir, f"fft_heatmaps_{tag}.png"))
+        out_path=os.path.join(OUT_DIR, f"fft_heatmaps_{tag}.png"))
 
     # ── 5. Pairwise distance matrix ────────────────────────────
     print("Plotting pairwise distance matrix …")
     plot_distance_matrix(
         mean_descs, domains, labels_map,
-        out_path=os.path.join(args.out_dir, f"fft_distances_{tag}.png"))
+        out_path=os.path.join(OUT_DIR, f"fft_distances_{tag}.png"))
 
     # ── 6. Radial profile curves ───────────────────────────────
-    if args.desc_mode == "radial":
+    if DESC_MODE == "radial":
         print("Plotting radial spectral profiles …")
         plot_radial_profiles(
-            mean_descs, domains, colors, labels_map, args.beta,
-            out_path=os.path.join(args.out_dir, f"fft_radial_{tag}.png"))
+            mean_descs, domains, colors, labels_map, BETA,
+            out_path=os.path.join(OUT_DIR, f"fft_radial_{tag}.png"))
 
     # ── 7. Domain classifier ───────────────────────────────────
-    clf_names = (["svm", "nn"] if args.classifier == "both"
-                 else [args.classifier])
+    clf_names = (["svm", "nn"] if CLASSIFIER == "both"
+                 else [CLASSIFIER])
     print(f"\nTraining domain classifier(s): {clf_names} …")
     results = {}
     for clf in clf_names:
         cm_path = os.path.join(
-            args.out_dir,
-            f"clf_confusion_{clf}_{args.desc_mode}_{tag}.png")
+            OUT_DIR,
+            f"clf_confusion_{clf}_{DESC_MODE}_{tag}.png")
         acc, _ = classify_domains(
             descriptors, domain_labels_arr, domains,
             classifier  = clf,
-            desc_mode   = args.desc_mode,
+            desc_mode   = DESC_MODE,
             out_path    = cm_path,
-            seed        = args.seed)
+            seed        = SEED)
         results[clf] = acc
 
     print(f"\n  ── Classifier Summary ──────────────────────────")
-    print(f"  Dataset    : {args.dataset.upper()}")
-    print(f"  Descriptor : {args.desc_mode}  ({len(descriptors[0])}-d)")
+    print(f"  Dataset    : {DATASET.upper()}")
+    print(f"  Descriptor : {DESC_MODE}  ({len(descriptors[0])}-d)")
     for clf, acc in results.items():
         print(f"  {clf.upper():<6} accuracy : {acc:.2f}%")
     print(f"  ──────────────────────────────────────────────")
@@ -749,11 +844,10 @@ if __name__ == "__main__":
         print(f"{sp_i:>{w}}" + "".join(f"{dist[i,j]:>{w}.4f}"
                                         for j in range(len(domains))))
 
-    print(f"\nDone. Figures saved to: {args.out_dir}/")
+    print(f"\nDone. Figures saved to: {OUT_DIR}/")
 
 
 import os
-import argparse
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
