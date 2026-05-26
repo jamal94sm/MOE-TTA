@@ -200,20 +200,38 @@ def plot_projections(descriptors, domain_labels_list, spectra,
     X = np.stack(descriptors)
     X = normalize(X, norm="l2")                      # L2-normalise before projection
 
+    # for t-SNE and UMAP, subsample if dataset is large (>2000 points is slow)
+    MAX_TSNE = 2000
+    if len(X) > MAX_TSNE and ("tsne" in methods or "umap" in methods):
+        rng     = np.random.RandomState(seed)
+        idx     = rng.choice(len(X), MAX_TSNE, replace=False)
+        X_sub   = X[idx]
+        dl_sub  = [domain_labels_list[i] for i in idx]
+        print(f"  Subsampled to {MAX_TSNE} points for t-SNE/UMAP "
+              f"(from {len(X)} total)")
+    else:
+        X_sub, dl_sub = X, domain_labels_list
+
     results = {}
 
     if "pca" in methods:
-        pca          = PCA(n_components=2, random_state=seed)
-        results["PCA"] = pca.fit_transform(X)
+        pca              = PCA(n_components=2, random_state=seed)
+        results["PCA"]   = (pca.fit_transform(X), domain_labels_list)
 
     if "tsne" in methods:
-        # PCA to 50d first for speed, then t-SNE
-        n_pca         = min(50, X.shape[1], X.shape[0] - 1)
-        X_pca         = PCA(n_components=n_pca, random_state=seed).fit_transform(X)
-        perplexity    = min(30, X.shape[0] // 4)
-        tsne          = TSNE(n_components=2, perplexity=perplexity,
-                              random_state=seed, n_iter=1000, verbose=0)
-        results["t-SNE"] = tsne.fit_transform(X_pca)
+        n_pca         = min(50, X_sub.shape[1], X_sub.shape[0] - 1)
+        X_pca         = PCA(n_components=n_pca, random_state=seed).fit_transform(X_sub)
+        perplexity    = min(30, X_sub.shape[0] // 4)
+        import sklearn
+        tsne_kwargs = dict(n_components=2, perplexity=perplexity,
+                           random_state=seed, verbose=0)
+        sk_version = tuple(int(x) for x in sklearn.__version__.split(".")[:2])
+        if sk_version >= (1, 5):
+            tsne_kwargs["max_iter"] = 1000
+        else:
+            tsne_kwargs["n_iter"] = 1000
+        tsne             = TSNE(**tsne_kwargs)
+        results["t-SNE"] = (tsne.fit_transform(X_pca), dl_sub)
         print(f"    t-SNE done (perplexity={perplexity})")
 
     if "umap" in methods:
@@ -221,7 +239,7 @@ def plot_projections(descriptors, domain_labels_list, spectra,
             import umap
             reducer          = umap.UMAP(n_components=2, random_state=seed,
                                           n_neighbors=15, min_dist=0.1)
-            results["UMAP"]  = reducer.fit_transform(X)
+            results["UMAP"]  = (reducer.fit_transform(X_sub), dl_sub)
             print("    UMAP done")
         except ImportError:
             print("    UMAP not installed — skipping (pip install umap-learn)")
@@ -235,8 +253,8 @@ def plot_projections(descriptors, domain_labels_list, spectra,
     if n_plots == 1:
         axes = [axes]
 
-    for ax, (name, coords) in zip(axes, results.items()):
-        plot_scatter(coords, domain_labels_list, spectra, name, ax,
+    for ax, (name, (coords, lbls)) in zip(axes, results.items()):
+        plot_scatter(coords, lbls, spectra, name, ax,
                      alpha=0.55, size=14)
 
     # shared legend
