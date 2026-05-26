@@ -61,6 +61,9 @@ def parse_casia_ms(data_root):
     return data   # {spectrum: {identity: [paths]}}
 
 
+CASIAMS_ROOT = "/home/pai-ng/Jamal/CASIA-MS-ROI"
+XJTU_ROOT    = "/home/pai-ng/Jamal/XJTU-UP"
+
 XJTU_VARIATIONS = [
     ("iPhone", "Flash"),
     ("iPhone", "Nature"),
@@ -326,7 +329,7 @@ def parse_args():
                    choices=["casiams", "xjtu"],
                    help="dataset to visualise")
     p.add_argument("--data_root",      default=None,
-                   help="path to dataset root (auto-detected from configs if omitted)")
+                   help="path to dataset root (default: hardcoded CASIAMS_ROOT / XJTU_ROOT)")
     p.add_argument("--beta",           type=float, default=0.1)
     p.add_argument("--img_side",       type=int,   default=128)
     p.add_argument("--max_per_domain", type=int,   default=None,
@@ -343,14 +346,9 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    # auto-detect data root from configs if not provided
     if args.data_root is None:
-        try:
-            from configs import CONFIG
-            args.data_root = (CONFIG["data_root"] if args.dataset == "casiams"
-                              else CONFIG["xjtu_data_root"])
-        except Exception:
-            raise ValueError("--data_root is required when configs.py is unavailable")
+        args.data_root = (CASIAMS_ROOT if args.dataset == "casiams"
+                          else XJTU_ROOT)
 
     if args.no_umap and "umap" in args.method:
         args.method = [m for m in args.method if m != "umap"]
