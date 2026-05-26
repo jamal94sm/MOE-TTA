@@ -266,6 +266,34 @@ def plot_mean_heatmaps(mean_amps, domains, img_side, beta,
     print(f"  Saved: {out_path}")
 
 
+def plot_distance_matrix(mean_descs, domains, labels_map, out_path):
+    """Pairwise cosine distance between domain mean descriptors."""
+    n    = len(domains)
+    vecs = np.stack([mean_descs[sp] for sp in domains])
+    norm = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8)
+    dist = 1.0 - (norm @ norm.T)
+
+    fig, ax = plt.subplots(figsize=(max(5, n*1.2), max(4, n*1.0)))
+    im      = ax.imshow(dist, cmap="RdYlGn_r", vmin=0, vmax=dist.max())
+    short   = [labels_map.get(sp, sp).split("(")[0].split("—")[0].strip()
+               for sp in domains]
+    ax.set_xticks(range(n)); ax.set_yticks(range(n))
+    ax.set_xticklabels(short, rotation=45, ha="right", fontsize=9)
+    ax.set_yticklabels(short, fontsize=9)
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, f"{dist[i,j]:.3f}", ha="center", va="center",
+                    fontsize=8,
+                    color="white" if dist[i,j] > dist.max()*0.5 else "black")
+    plt.colorbar(im, ax=ax, label="Cosine Distance")
+    ax.set_title("Pairwise Domain Distance\n(radial FFT profile, log-amplitude)",
+                 fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path}")
+
+
 def plot_radial_profiles(mean_descs, domains, colors, labels_map, beta, out_path):
     """
     Plot mean radial spectral profile per domain as overlaid line curves.
@@ -551,18 +579,3 @@ from sklearn.preprocessing import normalize
 
 
 # ── CASIA-MS dataset parser (mirrors datasets.py) ─────────────
-def parse_casia_ms(data_root):
-    """spectrum → identity → [path, ...]"""
-    from pathlib import Path
-    data     = defaultdict(lambda: defaultdict(list))
-    img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    for fname in sorted(os.listdir(data_root)):
-        if Path(fname).suffix.lower() not in img_exts:
-            continue
-        parts = os.path.splitext(fname)[0].split("_")
-        if len(parts) < 4:
-            continue
-        identity = f"{parts[0]}_{parts[1]}"
-        spectrum = parts[2]
-        data[spectrum][identity].append(os.path.join(data_root, fname))
-    return data
