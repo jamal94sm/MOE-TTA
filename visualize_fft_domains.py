@@ -179,20 +179,49 @@ def radial_profile(amp_2d, n_bins=64):
     return bins
 
 
-def extract_descriptor(path, img_side, beta, n_bins=64, mode="radial"):
+def _radial_distance_map(H, W):
+    cy, cx = H // 2, W // 2
+    Y, X   = np.ogrid[:H, :W]
+    return np.sqrt((X - cx)**2 + (Y - cy)**2).astype(np.float32)
+
+
+def _band_energy_ratios(amp_2d, R, r_max):
+    """6 frequency band energy ratios — normalisation-invariant."""
+    def E(r0, r1):
+        m = (R >= r0 * r_max) & (R < r1 * r_max)
+        return float(amp_2d[m].mean()) if m.any() else 1e-8
+    eps  = 1e-8
+    E_ul = E(0.00, 0.05); E_l = E(0.05, 0.15)
+    E_m  = E(0.15, 0.35); E_h = E(0.35, 0.65); E_uh = E(0.65, 1.00)
+    return np.array([E_h/(E_l+eps),  E_uh/(E_l+eps),  E_h/(E_ul+eps),
+                     E_m/(E_l+eps),  E_uh/(E_m+eps),  E_h/(E_m+eps)],
+                    dtype=np.float32)
+
+
+def extract_descriptor(path, img_side, beta, n_bins=64, mode="radial",
+                       alpha=1.0):
     """
-    Two descriptor modes (toggled via --desc_mode):
+    Three descriptor modes (--desc_mode):
 
-    "radial"  (recommended — best PCA separation in experiments):
-      log(1 + |FFT(image)|) → hard circular mask → radial profile
-      Captures spectral decay rate differences between domains.
-      460nm vs NIR bands differ in rolloff → clearly separated in PCA.
-      Descriptor: n_bins-d (default 64-d).
+    "radial"      — best PCA separation (recommended):
+      log(1+|FFT(image)|) → hard circular mask → radial profile (n_bins-d).
+      Captures spectral decay rate; 460nm vs NIR clearly separated in PCA.
 
-    "raw"  (baseline for comparison):
-      |FFT(image)| → hard circular mask → flatten
-      Raw low-frequency amplitude, no log transform.
-      Descriptor: (2*r)²-d where r = beta*img_side (e.g. 16384-d at beta=0.5).
+    "raw"         — baseline:
+      |FFT(image)| → hard circular mask → flatten.
+      Raw amplitude, no log transform, very high-dimensional.
+
+    "sensorprint" — forensic-style sensor fingerprint (residual+whitening):
+      Step 1 — residual = image − GaussianBlur(σ=2)
+               Removes palm identity/content (low-freq spatial structure).
+               Leaves device/sensor acquisition artifacts.
+      Step 2 — FFT → log(1+|FFT(residual)|)
+      Step 3 — whiten: amp_white = amp_log / r^α
+               Removes universal 1/f² natural-image prior.
+               Domain deviations from this prior become the signal.
+      Step 4 — hard_mask × radial_profile (n_bins-d)
+      Step 5 — band_energy_ratios (6-d)
+      concat → (n_bins+6)-d descriptor.
 
     Returns (raw_amp_for_heatmap, descriptor_vector).
     """
@@ -204,14 +233,43 @@ def extract_descriptor(path, img_side, beta, n_bins=64, mode="radial"):
     if mode == "raw":
         mask = hard_mask(img_side, img_side, beta)
         desc = (amp * mask).flatten()
-    else:   # "radial"
+
+    elif mode == "radial":
         amp_log = np.log1p(amp)
         mask    = hard_mask(img_side, img_side, beta)
         masked  = amp_log * mask
         desc    = radial_profile(masked, n_bins=n_bins)
 
-    return amp, desc
+    else:  # "sensorprint"
+        # Step 1 — residual spectrum
+        if _SCIPY_OK:
+            blurred  = gaussian_filter(img_np, sigma=2.0)
+            residual = img_np - blurred
+        else:
+            residual = img_np
+        amp_res = np.fft.fftshift(np.abs(np.fft.fft2(residual)))
+        amp_log = np.log1p(amp_res)
 
+        # Step 2 — power spectrum whitening (remove 1/f^alpha prior)
+        H, W    = amp_log.shape
+        R       = _radial_distance_map(H, W)
+        eps_w   = 1e-6
+        divisor = np.maximum(R ** alpha, eps_w)
+        amp_white           = amp_log / divisor
+        amp_white[R < 1]    = 0.0         # suppress DC
+
+        # Step 3 — radial profile on whitened residual
+        mask   = hard_mask(H, W, beta)
+        masked = amp_white * mask
+        r_prof = radial_profile(masked, n_bins=n_bins)
+
+        # Step 4 — band energy ratios
+        r_max  = min(H, W) / 2.0
+        ratios = _band_energy_ratios(amp_white, R, r_max)
+
+        desc = np.concatenate([r_prof, ratios])   # (n_bins+6)-d
+
+    return amp, desc
 
 
 # ══════════════════════════════════════════════════════════════
@@ -527,8 +585,12 @@ def parse_args():
     p.add_argument("--n_bins",         type=int,   default=64,
                    help="number of radial profile bins (radial mode only)")
     p.add_argument("--desc_mode",      default="radial",
-                   choices=["radial", "raw"],
-                   help="radial=log+radial profile (recommended); raw=flat masked amplitude")
+                   choices=["radial", "raw", "sensorprint"],
+                   help=("radial=log+radial profile (best PCA separation); "
+                         "raw=flat masked amplitude (baseline); "
+                         "sensorprint=residual+whitening+band_ratios"))
+    p.add_argument("--alpha",          type=float, default=1.0,
+                   help="whitening exponent for sensorprint mode (1/f^alpha, default=1.0)")
     p.add_argument("--classifier",     default="svm",
                    choices=["svm", "nn", "both"],
                    help="domain classifier: svm | nn | both")
@@ -562,7 +624,8 @@ if __name__ == "__main__":
     print(f"  data_root      : {args.data_root}")
     print(f"  beta           : {args.beta}")
     print(f"  n_bins         : {args.n_bins}  (radial mode)")
-    print(f"  desc_mode      : {args.desc_mode}")
+    print(f"  desc_mode      : {args.desc_mode}"
+          + (f"  alpha={args.alpha}" if args.desc_mode == "sensorprint" else ""))
     print(f"  classifier     : {args.classifier}")
     print(f"  img_side       : {args.img_side}")
     print(f"  max_per_domain : {args.max_per_domain or 'all'}")
@@ -604,7 +667,8 @@ if __name__ == "__main__":
             try:
                 amp, desc = extract_descriptor(
                 path, args.img_side, args.beta,
-                n_bins=args.n_bins, mode=args.desc_mode)
+                n_bins=args.n_bins, mode=args.desc_mode,
+                alpha=args.alpha)
                 descriptors.append(desc)
                 domain_labels_arr.append(sp)
                 sp_descs.append(desc)
