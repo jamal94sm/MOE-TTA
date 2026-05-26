@@ -142,7 +142,7 @@ def get_palette(dataset):
 
 
 # ══════════════════════════════════════════════════════════════
-#  FFT DESCRIPTOR  (Option 3 + 6 + 2 combination)
+#  FFT DESCRIPTOR
 # ══════════════════════════════════════════════════════════════
 
 try:
@@ -150,7 +150,6 @@ try:
     _SCIPY_OK = True
 except ImportError:
     _SCIPY_OK = False
-    print("[WARN] scipy not found — residual spectrum disabled, using raw image")
 
 
 def hard_mask(H, W, beta):
@@ -164,10 +163,8 @@ def hard_mask(H, W, beta):
 
 
 def radial_profile(amp_2d, n_bins=64):
-    """
-    Mean amplitude over n_bins concentric rings (radius 0 → min(H,W)/2).
-    Rotation-invariant, identity-agnostic, compact (n_bins-d).
-    """
+    """Mean log-amplitude over n_bins concentric rings.
+    Rotation-invariant, identity-agnostic, n_bins-d."""
     H, W   = amp_2d.shape
     cy, cx = H // 2, W // 2
     Y, X   = np.ogrid[:H, :W]
@@ -182,131 +179,38 @@ def radial_profile(amp_2d, n_bins=64):
     return bins
 
 
-def radial_distance_map(H, W):
-    """Precompute per-pixel radius from DC centre — reused for whitening."""
-    cy, cx = H // 2, W // 2
-    Y, X   = np.ogrid[:H, :W]
-    R      = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    return R
-
-
-def whiten_spectrum(amp_log, R, alpha=1.0, eps=1e-6):
+def extract_descriptor(path, img_side, beta, n_bins=64, mode="radial"):
     """
-    Option 6 — Power spectrum whitening.
-    Natural images follow a 1/f^α power law (α≈1 for amplitude).
-    Dividing by r^α removes this universal prior, leaving only
-    device-specific deviations from the natural image prior.
+    Two descriptor modes (toggled via --desc_mode):
 
-    After whitening:
-      - DC (r=0) is set to 0 (avoids division by zero)
-      - All sensors start from the same baseline
-      - Domain-specific deviations become the signal
-    """
-    divisor         = np.maximum(R ** alpha, eps)
-    whitened        = amp_log / divisor
-    whitened[R < 1] = 0.0    # suppress DC
-    return whitened
+    "radial"  (recommended — best PCA separation in experiments):
+      log(1 + |FFT(image)|) → hard circular mask → radial profile
+      Captures spectral decay rate differences between domains.
+      460nm vs NIR bands differ in rolloff → clearly separated in PCA.
+      Descriptor: n_bins-d (default 64-d).
 
+    "raw"  (baseline for comparison):
+      |FFT(image)| → hard circular mask → flatten
+      Raw low-frequency amplitude, no log transform.
+      Descriptor: (2*r)²-d where r = beta*img_side (e.g. 16384-d at beta=0.5).
 
-def band_energy_ratios(amp_2d, R, r_max):
-    """
-    Option 2 — Frequency band energy ratios.
-    Divides the spectrum into 5 bands and computes ratios.
-    Normalisation-invariant (brightness changes E_low and E_high equally,
-    ratio stays the same). Captures sharpness, blur, sensor noise level.
-
-    Bands (as fraction of r_max):
-      ultra-low  : 0    – 0.05
-      low        : 0.05 – 0.15
-      mid        : 0.15 – 0.35
-      high       : 0.35 – 0.65
-      ultra-high : 0.65 – 1.0
-
-    Ratios returned (6-d):
-      high/low, ultra-high/low, high/ultra-low,
-      mid/low, ultra-high/mid, high/mid
-    """
-    def band_energy(r0, r1):
-        m = (R >= r0 * r_max) & (R < r1 * r_max)
-        return float(amp_2d[m].mean()) if m.any() else 1e-8
-
-    E_ul  = band_energy(0.00, 0.05)
-    E_l   = band_energy(0.05, 0.15)
-    E_m   = band_energy(0.15, 0.35)
-    E_h   = band_energy(0.35, 0.65)
-    E_uh  = band_energy(0.65, 1.00)
-
-    eps = 1e-8
-    return np.array([
-        E_h  / (E_l  + eps),
-        E_uh / (E_l  + eps),
-        E_h  / (E_ul + eps),
-        E_m  / (E_l  + eps),
-        E_uh / (E_m  + eps),
-        E_h  / (E_m  + eps),
-    ], dtype=np.float32)
-
-
-def extract_descriptor(path, img_side, beta, n_bins=64, alpha=1.0):
-    """
-    Combined descriptor: Options 3 + 6 + 2.
-
-    Step 1 — Residual spectrum (Option 3):
-      residual = image − GaussianBlur(image, σ=2)
-      Removes palm content (low-freq identity structure).
-      Leaves device/sensor artifacts, noise patterns, acquisition signatures.
-
-    Step 2 — FFT amplitude + log transform:
-      amp  = |FFT(residual)|  fftshifted
-      amp_log = log(1 + amp)   compresses dynamic range
-
-    Step 3 — Power spectrum whitening (Option 6):
-      amp_white = amp_log / r^α
-      Removes the universal 1/f natural-image prior.
-      Domain-specific deviations from this prior become the signal.
-
-    Step 4 — Radial profile on whitened spectrum (Option 1):
-      n_bins ring averages → n_bins-d descriptor
-
-    Step 5 — Band energy ratios on whitened spectrum (Option 2):
-      5 frequency bands → 6 ratios → 6-d descriptor
-
-    Final descriptor: concat(radial_profile, band_ratios) → (n_bins+6)-d
-    Also returns raw amplitude of the original image for heatmap plotting.
+    Returns (raw_amp_for_heatmap, descriptor_vector).
     """
     img    = Image.open(path).convert("L").resize(
         (img_side, img_side), Image.BILINEAR)
     img_np = np.array(img, dtype=np.float32) / 255.0
+    amp    = np.fft.fftshift(np.abs(np.fft.fft2(img_np)))   # raw for heatmap
 
-    # raw amp of original image (for heatmap — unchanged)
-    amp_raw = np.fft.fftshift(np.abs(np.fft.fft2(img_np)))
+    if mode == "raw":
+        mask = hard_mask(img_side, img_side, beta)
+        desc = (amp * mask).flatten()
+    else:   # "radial"
+        amp_log = np.log1p(amp)
+        mask    = hard_mask(img_side, img_side, beta)
+        masked  = amp_log * mask
+        desc    = radial_profile(masked, n_bins=n_bins)
 
-    # ── Option 3: residual spectrum ─────────────────────────────
-    if _SCIPY_OK:
-        blurred  = gaussian_filter(img_np, sigma=2.0)
-        residual = img_np - blurred
-    else:
-        residual = img_np   # fallback: no residual
-
-    amp     = np.fft.fftshift(np.abs(np.fft.fft2(residual)))
-    amp_log = np.log1p(amp)                                  # log transform
-
-    # ── Option 6: power spectrum whitening ──────────────────────
-    H, W = amp_log.shape
-    R    = radial_distance_map(H, W)
-    amp_white = whiten_spectrum(amp_log, R, alpha=alpha)
-
-    # ── Option 1: radial profile on whitened residual spectrum ───
-    mask   = hard_mask(H, W, beta)
-    masked = amp_white * mask
-    r_prof = radial_profile(masked, n_bins=n_bins)
-
-    # ── Option 2: band energy ratios on whitened spectrum ────────
-    r_max  = min(H, W) / 2.0
-    ratios = band_energy_ratios(amp_white, R, r_max)
-
-    desc = np.concatenate([r_prof, ratios])                  # (n_bins+6)-d
-    return amp_raw, desc
+    return amp, desc
 
 
 
@@ -392,6 +296,90 @@ def plot_distance_matrix(mean_descs, domains, labels_map, out_path):
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out_path}")
+
+
+
+def classify_domains(descriptors, domain_labels_list, domains,
+                     classifier="svm", desc_mode="radial",
+                     out_path=None, seed=42):
+    """
+    Train a domain classifier and report 5-fold cross-validated accuracy.
+
+    Classifiers:
+      "svm" — RBF SVM. Best for small-to-medium datasets, nonlinear boundaries.
+      "nn"  — MLP (2 hidden layers). Better for high-dimensional raw descriptors.
+
+    Reports: per-class accuracy, confusion matrix figure.
+    """
+    from sklearn.preprocessing import LabelEncoder, StandardScaler
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    from sklearn.metrics import (classification_report, confusion_matrix,
+                                 accuracy_score)
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.pipeline import Pipeline
+
+    X  = np.stack(descriptors).astype(np.float32)
+    le = LabelEncoder()
+    le.fit(domains)
+    y  = le.transform(domain_labels_list)
+
+    if classifier == "svm":
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf",    SVC(kernel="rbf", C=10.0, gamma="scale",
+                           random_state=seed, decision_function_shape="ovr")),
+        ])
+    else:  # nn
+        hidden = (256, 128) if X.shape[1] > 100 else (128, 64)
+        model  = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf",    MLPClassifier(hidden_layer_sizes=hidden,
+                                     max_iter=500, random_state=seed,
+                                     early_stopping=True,
+                                     n_iter_no_change=20)),
+        ])
+
+    cv     = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    y_pred = cross_val_predict(model, X, y, cv=cv)
+    acc    = accuracy_score(y, y_pred) * 100
+    report = classification_report(y, y_pred,
+                                   target_names=le.classes_, digits=3)
+    cm     = confusion_matrix(y, y_pred)
+
+    print("\n" + "="*60)
+    print(f"  Domain Classifier — {classifier.upper()}  |  "
+          f"descriptor: {desc_mode}  |  dim={X.shape[1]}")
+    print(f"  5-fold CV accuracy: {acc:.2f}%")
+    print("=" * 60)
+    print(report)
+
+    if out_path is not None:
+        fig, ax = plt.subplots(figsize=(max(5, len(domains)*0.9),
+                                        max(4, len(domains)*0.8)))
+        cm_norm = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8)
+        im      = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1)
+        labels_s = [l.split("(")[0].split("—")[0].strip() for l in le.classes_]
+        ax.set_xticks(range(len(domains))); ax.set_yticks(range(len(domains)))
+        ax.set_xticklabels(labels_s, rotation=45, ha="right", fontsize=9)
+        ax.set_yticklabels(labels_s, fontsize=9)
+        for i in range(len(domains)):
+            for j in range(len(domains)):
+                ax.text(j, i, f"{cm[i,j]}", ha="center", va="center",
+                        fontsize=9,
+                        color="white" if cm_norm[i,j] > 0.5 else "black")
+        plt.colorbar(im, ax=ax, label="Normalised count")
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+        ax.set_title(f"Domain Classifier — {classifier.upper()}\n"
+                     f"Descriptor: {desc_mode} ({X.shape[1]}-d)  "
+                     f"Acc={acc:.1f}%  5-fold CV",
+                     fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {out_path}")
+
+    return acc, report
 
 
 def plot_radial_profiles(mean_descs, domains, colors, labels_map, beta, out_path):
@@ -534,12 +522,16 @@ def parse_args():
                    help="dataset to visualise")
     p.add_argument("--data_root",      default=None,
                    help="path to dataset root (default: hardcoded CASIAMS_ROOT / XJTU_ROOT)")
-    p.add_argument("--beta",           type=float, default=0.5,
+    p.add_argument("--beta",           type=float, default=0.4,
                    help="hard mask radius as fraction of image size")
-    p.add_argument("--alpha",          type=float, default=1.0,
-                   help="whitening exponent (1/f^alpha prior, default=1.0)")
     p.add_argument("--n_bins",         type=int,   default=64,
-                   help="number of radial profile bins")
+                   help="number of radial profile bins (radial mode only)")
+    p.add_argument("--desc_mode",      default="radial",
+                   choices=["radial", "raw"],
+                   help="radial=log+radial profile (recommended); raw=flat masked amplitude")
+    p.add_argument("--classifier",     default="svm",
+                   choices=["svm", "nn", "both"],
+                   help="domain classifier: svm | nn | both")
     p.add_argument("--img_side",       type=int,   default=128)
     p.add_argument("--max_per_domain", type=int,   default=None,
                    help="max images per domain (None = all)")
@@ -568,9 +560,10 @@ if __name__ == "__main__":
     print(f"\n{'='*56}")
     print(f"  FFT Domain Visualisation — {args.dataset.upper()}")
     print(f"  data_root      : {args.data_root}")
-    print(f"  beta           : {args.beta}  (hard mask radius)")
-    print(f"  alpha          : {args.alpha}  (whitening 1/f^alpha)")
-    print(f"  n_bins         : {args.n_bins}  (radial profile bins)")
+    print(f"  beta           : {args.beta}")
+    print(f"  n_bins         : {args.n_bins}  (radial mode)")
+    print(f"  desc_mode      : {args.desc_mode}")
+    print(f"  classifier     : {args.classifier}")
     print(f"  img_side       : {args.img_side}")
     print(f"  max_per_domain : {args.max_per_domain or 'all'}")
     print(f"  methods        : {args.method}")
@@ -611,7 +604,7 @@ if __name__ == "__main__":
             try:
                 amp, desc = extract_descriptor(
                 path, args.img_side, args.beta,
-                n_bins=args.n_bins, alpha=args.alpha)
+                n_bins=args.n_bins, mode=args.desc_mode)
                 descriptors.append(desc)
                 domain_labels_arr.append(sp)
                 sp_descs.append(desc)
@@ -651,10 +644,35 @@ if __name__ == "__main__":
         out_path=os.path.join(args.out_dir, f"fft_distances_{tag}.png"))
 
     # ── 6. Radial profile curves ───────────────────────────────
-    print("Plotting radial spectral profiles …")
-    plot_radial_profiles(
-        mean_descs, domains, colors, labels_map, args.beta,
-        out_path=os.path.join(args.out_dir, f"fft_radial_{tag}.png"))
+    if args.desc_mode == "radial":
+        print("Plotting radial spectral profiles …")
+        plot_radial_profiles(
+            mean_descs, domains, colors, labels_map, args.beta,
+            out_path=os.path.join(args.out_dir, f"fft_radial_{tag}.png"))
+
+    # ── 7. Domain classifier ───────────────────────────────────
+    clf_names = (["svm", "nn"] if args.classifier == "both"
+                 else [args.classifier])
+    print(f"\nTraining domain classifier(s): {clf_names} …")
+    results = {}
+    for clf in clf_names:
+        cm_path = os.path.join(
+            args.out_dir,
+            f"clf_confusion_{clf}_{args.desc_mode}_{tag}.png")
+        acc, _ = classify_domains(
+            descriptors, domain_labels_arr, domains,
+            classifier  = clf,
+            desc_mode   = args.desc_mode,
+            out_path    = cm_path,
+            seed        = args.seed)
+        results[clf] = acc
+
+    print(f"\n  ── Classifier Summary ──────────────────────────")
+    print(f"  Dataset    : {args.dataset.upper()}")
+    print(f"  Descriptor : {args.desc_mode}  ({len(descriptors[0])}-d)")
+    for clf, acc in results.items():
+        print(f"  {clf.upper():<6} accuracy : {acc:.2f}%")
+    print(f"  ──────────────────────────────────────────────")
 
     # ── 6. Console summary ─────────────────────────────────────
     print("\nPairwise cosine distances:")
