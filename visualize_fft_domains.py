@@ -142,15 +142,19 @@ def get_palette(dataset):
 
 
 # ══════════════════════════════════════════════════════════════
-#  FFT DESCRIPTOR
+#  FFT DESCRIPTOR  (Option 3 + 6 + 2 combination)
 # ══════════════════════════════════════════════════════════════
 
+try:
+    from scipy.ndimage import gaussian_filter
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+    print("[WARN] scipy not found — residual spectrum disabled, using raw image")
+
+
 def hard_mask(H, W, beta):
-    """
-    Binary circular mask centred at DC.
-    Radius = beta × min(H, W).  All pixels within radius → 1, outside → 0.
-    Sharper than Gaussian — no gradual fade, exact frequency cutoff.
-    """
+    """Binary circular mask. Radius = beta × min(H,W)."""
     cy, cx = H // 2, W // 2
     ys     = np.arange(H) - cy
     xs     = np.arange(W) - cx
@@ -159,21 +163,12 @@ def hard_mask(H, W, beta):
     return ((xs**2 + ys**2) <= radius**2).astype(np.float32)
 
 
-def radial_profile(amp_log, n_bins=64):
+def radial_profile(amp_2d, n_bins=64):
     """
-    Average log-amplitude over concentric rings → 1D spectral profile.
-
-    Why radial averaging:
-      - Rotation-invariant: ring mean is the same regardless of palm orientation.
-      - Removes identity-specific spatial structure: a person's low-frequency
-        pattern occupies specific 2D locations; averaging over rings collapses
-        this to a pure frequency-magnitude profile that depends on the sensor's
-        spectral response, not on which identity was captured.
-      - Compact: 64-d instead of 16384-d, much faster for PCA/t-SNE/UMAP.
-
-    Bins are evenly spaced from radius 0 to min(H,W)/2.
+    Mean amplitude over n_bins concentric rings (radius 0 → min(H,W)/2).
+    Rotation-invariant, identity-agnostic, compact (n_bins-d).
     """
-    H, W   = amp_log.shape
+    H, W   = amp_2d.shape
     cy, cx = H // 2, W // 2
     Y, X   = np.ogrid[:H, :W]
     R      = np.sqrt((X - cx)**2 + (Y - cy)**2)
@@ -183,31 +178,136 @@ def radial_profile(amp_log, n_bins=64):
     for b in range(n_bins):
         ring = (R >= edges[b]) & (R < edges[b + 1])
         if ring.any():
-            bins[b] = amp_log[ring].mean()
+            bins[b] = amp_2d[ring].mean()
     return bins
 
 
-def extract_descriptor(path, img_side, beta, n_bins=64):
-    """
-    1. Load image, resize, convert to float.
-    2. Compute FFT amplitude (fftshifted, DC at centre).
-    3. Log-transform: log(1 + amp)  — compresses dynamic range so
-       all frequency bins contribute proportionally instead of the
-       DC component dominating everything.
-    4. Apply hard circular mask (radius = beta × img_side).
-    5. Compute radial profile (n_bins rings) → compact 1-D descriptor.
+def radial_distance_map(H, W):
+    """Precompute per-pixel radius from DC centre — reused for whitening."""
+    cy, cx = H // 2, W // 2
+    Y, X   = np.ogrid[:H, :W]
+    R      = np.sqrt((X - cx)**2 + (Y - cy)**2)
+    return R
 
-    Also returns the raw amp (unmasked, unlogged) for heatmap plotting.
+
+def whiten_spectrum(amp_log, R, alpha=1.0, eps=1e-6):
+    """
+    Option 6 — Power spectrum whitening.
+    Natural images follow a 1/f^α power law (α≈1 for amplitude).
+    Dividing by r^α removes this universal prior, leaving only
+    device-specific deviations from the natural image prior.
+
+    After whitening:
+      - DC (r=0) is set to 0 (avoids division by zero)
+      - All sensors start from the same baseline
+      - Domain-specific deviations become the signal
+    """
+    divisor         = np.maximum(R ** alpha, eps)
+    whitened        = amp_log / divisor
+    whitened[R < 1] = 0.0    # suppress DC
+    return whitened
+
+
+def band_energy_ratios(amp_2d, R, r_max):
+    """
+    Option 2 — Frequency band energy ratios.
+    Divides the spectrum into 5 bands and computes ratios.
+    Normalisation-invariant (brightness changes E_low and E_high equally,
+    ratio stays the same). Captures sharpness, blur, sensor noise level.
+
+    Bands (as fraction of r_max):
+      ultra-low  : 0    – 0.05
+      low        : 0.05 – 0.15
+      mid        : 0.15 – 0.35
+      high       : 0.35 – 0.65
+      ultra-high : 0.65 – 1.0
+
+    Ratios returned (6-d):
+      high/low, ultra-high/low, high/ultra-low,
+      mid/low, ultra-high/mid, high/mid
+    """
+    def band_energy(r0, r1):
+        m = (R >= r0 * r_max) & (R < r1 * r_max)
+        return float(amp_2d[m].mean()) if m.any() else 1e-8
+
+    E_ul  = band_energy(0.00, 0.05)
+    E_l   = band_energy(0.05, 0.15)
+    E_m   = band_energy(0.15, 0.35)
+    E_h   = band_energy(0.35, 0.65)
+    E_uh  = band_energy(0.65, 1.00)
+
+    eps = 1e-8
+    return np.array([
+        E_h  / (E_l  + eps),
+        E_uh / (E_l  + eps),
+        E_h  / (E_ul + eps),
+        E_m  / (E_l  + eps),
+        E_uh / (E_m  + eps),
+        E_h  / (E_m  + eps),
+    ], dtype=np.float32)
+
+
+def extract_descriptor(path, img_side, beta, n_bins=64, alpha=1.0):
+    """
+    Combined descriptor: Options 3 + 6 + 2.
+
+    Step 1 — Residual spectrum (Option 3):
+      residual = image − GaussianBlur(image, σ=2)
+      Removes palm content (low-freq identity structure).
+      Leaves device/sensor artifacts, noise patterns, acquisition signatures.
+
+    Step 2 — FFT amplitude + log transform:
+      amp  = |FFT(residual)|  fftshifted
+      amp_log = log(1 + amp)   compresses dynamic range
+
+    Step 3 — Power spectrum whitening (Option 6):
+      amp_white = amp_log / r^α
+      Removes the universal 1/f natural-image prior.
+      Domain-specific deviations from this prior become the signal.
+
+    Step 4 — Radial profile on whitened spectrum (Option 1):
+      n_bins ring averages → n_bins-d descriptor
+
+    Step 5 — Band energy ratios on whitened spectrum (Option 2):
+      5 frequency bands → 6 ratios → 6-d descriptor
+
+    Final descriptor: concat(radial_profile, band_ratios) → (n_bins+6)-d
+    Also returns raw amplitude of the original image for heatmap plotting.
     """
     img    = Image.open(path).convert("L").resize(
         (img_side, img_side), Image.BILINEAR)
     img_np = np.array(img, dtype=np.float32) / 255.0
-    amp    = np.fft.fftshift(np.abs(np.fft.fft2(img_np)))   # raw for heatmap
-    amp_log = np.log1p(amp)                                   # log transform
-    mask    = hard_mask(img_side, img_side, beta)
-    amp_masked = amp_log * mask                               # zero outside radius
-    desc    = radial_profile(amp_masked, n_bins=n_bins)       # 1-D profile
-    return amp, desc                                          # (raw_amp, descriptor)
+
+    # raw amp of original image (for heatmap — unchanged)
+    amp_raw = np.fft.fftshift(np.abs(np.fft.fft2(img_np)))
+
+    # ── Option 3: residual spectrum ─────────────────────────────
+    if _SCIPY_OK:
+        blurred  = gaussian_filter(img_np, sigma=2.0)
+        residual = img_np - blurred
+    else:
+        residual = img_np   # fallback: no residual
+
+    amp     = np.fft.fftshift(np.abs(np.fft.fft2(residual)))
+    amp_log = np.log1p(amp)                                  # log transform
+
+    # ── Option 6: power spectrum whitening ──────────────────────
+    H, W = amp_log.shape
+    R    = radial_distance_map(H, W)
+    amp_white = whiten_spectrum(amp_log, R, alpha=alpha)
+
+    # ── Option 1: radial profile on whitened residual spectrum ───
+    mask   = hard_mask(H, W, beta)
+    masked = amp_white * mask
+    r_prof = radial_profile(masked, n_bins=n_bins)
+
+    # ── Option 2: band energy ratios on whitened spectrum ────────
+    r_max  = min(H, W) / 2.0
+    ratios = band_energy_ratios(amp_white, R, r_max)
+
+    desc = np.concatenate([r_prof, ratios])                  # (n_bins+6)-d
+    return amp_raw, desc
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -413,7 +513,7 @@ def plot_projections(descriptors, domain_labels_list, domains, methods,
                bbox_to_anchor=(0.5, -0.06), frameon=True)
 
     fig.suptitle(
-        f"Low-Frequency FFT Amplitude — Domain Separability\n"
+        f"Residual FFT + Whitening + Band Ratios — Domain Separability\n"
         f"{dataset_name.upper()}  |  β={beta}  |  {n_total} images",
         fontsize=13, fontweight="bold", y=1.02)
 
@@ -434,7 +534,12 @@ def parse_args():
                    help="dataset to visualise")
     p.add_argument("--data_root",      default=None,
                    help="path to dataset root (default: hardcoded CASIAMS_ROOT / XJTU_ROOT)")
-    p.add_argument("--beta",           type=float, default=0.1)
+    p.add_argument("--beta",           type=float, default=0.5,
+                   help="hard mask radius as fraction of image size")
+    p.add_argument("--alpha",          type=float, default=1.0,
+                   help="whitening exponent (1/f^alpha prior, default=1.0)")
+    p.add_argument("--n_bins",         type=int,   default=64,
+                   help="number of radial profile bins")
     p.add_argument("--img_side",       type=int,   default=128)
     p.add_argument("--max_per_domain", type=int,   default=None,
                    help="max images per domain (None = all)")
@@ -463,7 +568,9 @@ if __name__ == "__main__":
     print(f"\n{'='*56}")
     print(f"  FFT Domain Visualisation — {args.dataset.upper()}")
     print(f"  data_root      : {args.data_root}")
-    print(f"  beta           : {args.beta}")
+    print(f"  beta           : {args.beta}  (hard mask radius)")
+    print(f"  alpha          : {args.alpha}  (whitening 1/f^alpha)")
+    print(f"  n_bins         : {args.n_bins}  (radial profile bins)")
     print(f"  img_side       : {args.img_side}")
     print(f"  max_per_domain : {args.max_per_domain or 'all'}")
     print(f"  methods        : {args.method}")
@@ -502,7 +609,9 @@ if __name__ == "__main__":
         sp_descs, sp_amps = [], []
         for path in paths:
             try:
-                amp, desc = extract_descriptor(path, args.img_side, args.beta)
+                amp, desc = extract_descriptor(
+                path, args.img_side, args.beta,
+                n_bins=args.n_bins, alpha=args.alpha)
                 descriptors.append(desc)
                 domain_labels_arr.append(sp)
                 sp_descs.append(desc)
