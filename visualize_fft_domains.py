@@ -635,14 +635,14 @@ if __name__ == "__main__":
     #   BETA=0.5 → inner 50% = entire half-spectrum
     #   For "radial" mode, BETA affects which rings are included.
     #   For "raw" mode, BETA determines descriptor dimension.
-    BETA           = 0.4
+    BETA           = 0.5
 
     # N_BINS: number of concentric rings for radial profile.
     #   More bins → finer frequency resolution but noisier at high radii.
     #   32  → coarse, fast, less discriminative
     #   64  → recommended balance
     #   128 → fine-grained but slower
-    N_BINS         = 64
+    N_BINS         = 128
 
     # ALPHA: whitening exponent for "sensorprint" mode only.
     #   Natural images follow 1/f^alpha power law (alpha≈1 for amplitude).
