@@ -234,8 +234,7 @@ def extract_descriptor(path, img_side, beta, n_bins=64, mode="radial",
     elif mode == "radial":
         amp_log = np.log1p(amp)
         mask    = hard_mask(img_side, img_side, beta)
-        masked  = amp_log * mask
-        desc    = radial_profile(masked, n_bins=n_bins)
+        desc    = (amp_log * mask).flatten()
 
     else:  # "sensorprint"
         # Step 1 — residual spectrum
@@ -378,6 +377,15 @@ def classify_domains(descriptors, domain_labels_list, domains,
     le = LabelEncoder()
     le.fit(domains)
     y  = le.transform(domain_labels_list)
+
+    # PCA pre-reduction for high-dim descriptors (raw / radial are 16384-d)
+    # SVM kernel computation is O(N²×D) — reduce to 64-d first
+    orig_dim = X.shape[1]
+    if orig_dim > 200:
+        from sklearn.decomposition import PCA as _PCA
+        n_comp = min(64, X.shape[0] - 1, orig_dim)
+        X      = _PCA(n_components=n_comp, random_state=seed).fit_transform(X)
+        print(f"  PCA pre-reduction: {orig_dim}-d → {n_comp}-d")
 
     if classifier == "svm":
         model = Pipeline([
@@ -596,11 +604,9 @@ if __name__ == "__main__":
     #   2. Apply log(1+amp) to compress dynamic range
     #      (without log, the DC component at r=0 dominates everything)
     #   3. Apply hard circular mask (radius = BETA × IMG_SIDE)
-    #   4. Average log-amplitude over N_BINS concentric rings
-    #   → descriptor: N_BINS-d (default 64-d)
-    #   Why it works: different wavelength sensors (460nm vs 940nm) have
-    #   different spectral decay rates — the log-radial profile captures
-    #   this rolloff, which is domain-specific but identity-independent.
+    #      → flatten masked log-amplitude to descriptor vector
+    #   Dim: IMG_SIDE × IMG_SIDE = 128 × 128 = 16,384-d
+    #   (same size as "raw" but log transform makes domain structure visible)
     #
     # "raw" (baseline):
     #   1. Compute |FFT(image)|
@@ -625,7 +631,7 @@ if __name__ == "__main__":
     #   Best for devices/lighting (XJTU). Worse for CASIA-MS because
     #   the residual removes the low-freq spectral rolloff that IS the
     #   domain signal there.
-    DESC_MODE      = "raw"
+    DESC_MODE      = "radial"
 
     # ── FFT parameters ─────────────────────────────────────────
     # BETA: radius of the hard circular mask as a fraction of IMG_SIDE.
@@ -635,7 +641,7 @@ if __name__ == "__main__":
     #   BETA=0.5 → inner 50% = entire half-spectrum
     #   For "radial" mode, BETA affects which rings are included.
     #   For "raw" mode, BETA determines descriptor dimension.
-    BETA           = 0.20
+    BETA           = 0.1
 
     # N_BINS: number of concentric rings for radial profile.
     #   More bins → finer frequency resolution but noisier at high radii.
