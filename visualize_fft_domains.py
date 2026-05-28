@@ -625,7 +625,7 @@ if __name__ == "__main__":
     #   Best for devices/lighting (XJTU). Worse for CASIA-MS because
     #   the residual removes the low-freq spectral rolloff that IS the
     #   domain signal there.
-    DESC_MODE      = "radial"
+    DESC_MODE      = "sensorprint"
 
     # ── FFT parameters ─────────────────────────────────────────
     # BETA: radius of the hard circular mask as a fraction of IMG_SIDE.
@@ -642,7 +642,7 @@ if __name__ == "__main__":
     #   32  → coarse, fast, less discriminative
     #   64  → recommended balance
     #   128 → fine-grained but slower
-    N_BINS         = 128*8
+    N_BINS         = 256
 
     # ALPHA: whitening exponent for "sensorprint" mode only.
     #   Natural images follow 1/f^alpha power law (alpha≈1 for amplitude).
