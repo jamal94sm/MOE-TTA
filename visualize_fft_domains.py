@@ -625,7 +625,7 @@ if __name__ == "__main__":
     #   Best for devices/lighting (XJTU). Worse for CASIA-MS because
     #   the residual removes the low-freq spectral rolloff that IS the
     #   domain signal there.
-    DESC_MODE      = "sensorprint"
+    DESC_MODE      = "raw"
 
     # ── FFT parameters ─────────────────────────────────────────
     # BETA: radius of the hard circular mask as a fraction of IMG_SIDE.
