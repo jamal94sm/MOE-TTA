@@ -680,7 +680,7 @@ if __name__ == "__main__":
     #          Better for: high-dimensional "raw" descriptors (~16384-d).
     #          Slower to train, more sensitive to feature scaling.
     # "both" : runs both classifiers and reports both accuracies.
-    CLASSIFIER     = "svm"
+    CLASSIFIER     = "nn"
 
     # ── Sampling ───────────────────────────────────────────────
     # MAX_PER_DOMAIN: subsample to this many images per domain.
