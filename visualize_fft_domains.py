@@ -589,7 +589,7 @@ if __name__ == "__main__":
     #             (460nm, 630nm, 700nm, 850nm, 940nm, WHT)
     # "xjtu"    : 4 clients, one per (smartphone × lighting)
     #             (iPhone/Flash, iPhone/Nature, huawei/Flash, huawei/Nature)
-    DATASET        = "casiams"
+    DATASET        = "xjtu"
 
     # Override data path. None → uses CASIAMS_ROOT / XJTU_ROOT at top of file.
     DATA_ROOT      = None
@@ -641,7 +641,7 @@ if __name__ == "__main__":
     #   BETA=0.5 → inner 50% = entire half-spectrum
     #   For "radial" mode, BETA affects which rings are included.
     #   For "raw" mode, BETA determines descriptor dimension.
-    BETA           = 0.15
+    BETA           = 0.1
 
     # N_BINS: number of concentric rings for radial profile.
     #   More bins → finer frequency resolution but noisier at high radii.
