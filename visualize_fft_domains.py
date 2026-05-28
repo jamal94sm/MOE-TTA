@@ -631,7 +631,7 @@ if __name__ == "__main__":
     #   Best for devices/lighting (XJTU). Worse for CASIA-MS because
     #   the residual removes the low-freq spectral rolloff that IS the
     #   domain signal there.
-    DESC_MODE      = "radial"
+    DESC_MODE      = "raw"
 
     # ── FFT parameters ─────────────────────────────────────────
     # BETA: radius of the hard circular mask as a fraction of IMG_SIDE.
@@ -641,7 +641,7 @@ if __name__ == "__main__":
     #   BETA=0.5 → inner 50% = entire half-spectrum
     #   For "radial" mode, BETA affects which rings are included.
     #   For "raw" mode, BETA determines descriptor dimension.
-    BETA           = 0.1
+    BETA           = 0.15
 
     # N_BINS: number of concentric rings for radial profile.
     #   More bins → finer frequency resolution but noisier at high radii.
