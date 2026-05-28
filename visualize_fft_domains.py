@@ -642,7 +642,7 @@ if __name__ == "__main__":
     #   32  → coarse, fast, less discriminative
     #   64  → recommended balance
     #   128 → fine-grained but slower
-    N_BINS         = 128*2
+    N_BINS         = 128*4
 
     # ALPHA: whitening exponent for "sensorprint" mode only.
     #   Natural images follow 1/f^alpha power law (alpha≈1 for amplitude).
