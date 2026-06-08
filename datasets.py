@@ -258,7 +258,7 @@ def get_crs_sequence(data_dir, num_rounds=3, batch_size=50,
                 subset = ds
 
             loader = DataLoader(subset, batch_size=batch_size,
-                                shuffle=False, num_workers=num_workers,
+                                shuffle=True, num_workers=num_workers,
                                 pin_memory=True, drop_last=False)
             name = f"{domain}_R{round_idx+1}"
             sequence.append((name, loader))
