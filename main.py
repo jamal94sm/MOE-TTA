@@ -37,6 +37,107 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
+
+########## ground-truth distance among domains
+def print_domain_distance_table(cfg, num_batches_to_sample=10):
+    """
+    Pre-computes and prints a 15x15 pairwise Mahalanobis distance table 
+    for all domains to help tune the FDD threshold.
+    """
+    print(f"\n{'='*90}")
+    print(f"  PRE-COMPUTING PAIRWISE DOMAIN DISTANCES (Estimating from {num_batches_to_sample} batches each)")
+    print(f"{'='*90}")
+
+    # Initialize a temporary FDD just for feature extraction
+    fdd = FrequencyDomainDiscriminator(
+        freq_radius=cfg.fdd_freq_radius,
+        threshold=cfg.fdd_threshold,
+        shrinkage=cfg.fdd_shrinkage,
+        init_var=cfg.fdd_init_var,
+        diagonal=cfg.fdd_diagonal,
+        device=cfg.device,
+    )
+
+    domain_sequence = get_domain_sequence(cfg)
+    domain_names = []
+    domain_stats = []
+
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(cfg.device)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(cfg.device)
+
+    # 1. Extract features and compute true mu & sigma for each domain
+    for domain_name, loader in domain_sequence:
+        short_name = domain_name.replace("_noise", "").replace("_blur", "").replace("_transform", "").replace("_compression", "")
+        domain_names.append(short_name[:7]) # Keep names short for the table
+        
+        all_descs = []
+        for batch_idx, (images, _) in enumerate(loader):
+            if batch_idx >= num_batches_to_sample:
+                break
+            
+            images = images.to(cfg.device)
+            raw_images = images * imagenet_std + imagenet_mean
+            
+            with torch.no_grad():
+                descs = fdd.extract_descriptor(raw_images)
+                all_descs.append(descs)
+                
+        all_descs = torch.cat(all_descs, dim=0) # [N, df]
+        
+        mu = all_descs.mean(dim=0)
+        if fdd.diagonal:
+            sigma = all_descs.var(dim=0, unbiased=False)
+        else:
+            diff = all_descs - mu
+            sigma = (diff.T @ diff) / len(all_descs)
+            
+        domain_stats.append({"mu": mu, "sigma": sigma})
+
+    # 2. Compute Pairwise Mahalanobis Distances
+    num_domains = len(domain_names)
+    dist_matrix = np.zeros((num_domains, num_domains))
+
+    for i in range(num_domains):       # i = Target Distribution (The memory)
+        for j in range(num_domains):   # j = Query (The incoming batch)
+            diff = domain_stats[j]["mu"] - domain_stats[i]["mu"]
+            
+            if fdd.diagonal:
+                sigma_reg = (1 - fdd.eps) * domain_stats[i]["sigma"] + fdd.eps
+                dist = (diff ** 2 / sigma_reg).mean().item()
+            else:
+                cov_reg = (1 - fdd.eps) * domain_stats[i]["sigma"] + fdd.eps * torch.eye(fdd.df, device=cfg.device)
+                dist = (diff @ torch.linalg.solve(cov_reg, diff)).item() / fdd.df
+                
+            dist_matrix[i, j] = dist
+
+    # 3. Print the formatted table
+    print("\nPairwise Mahalanobis Distances (Mean across dimensions):")
+    print("Row = Target Distribution (Memory) | Column = Incoming Query Domain\n")
+    
+    # Print Header
+    header = f"{'':>10} | " + " | ".join([f"{name:>7}" for name in domain_names])
+    print(header)
+    print("-" * len(header))
+    
+    # Print Rows
+    for i in range(num_domains):
+        row_str = f"{domain_names[i]:>10} | "
+        for j in range(num_domains):
+            val = dist_matrix[i, j]
+            if i == j:
+                row_str += f"\033[92m{val:7.2f}\033[0m | " # Green for self-distance
+            elif val < cfg.fdd_threshold:
+                row_str += f"\033[93m{val:7.2f}\033[0m | " # Yellow if under threshold (collision)
+            else:
+                row_str += f"{val:7.2f} | "
+        print(row_str)
+    
+    print("\n* Green: Distance to itself (Expected to be ~0.00)")
+    print(f"* Yellow: Distance falls below your current threshold ({cfg.fdd_threshold})")
+    print("="*90 + "\n")
+
+
+
 # ─── Entropy loss with confidence filtering (Eq. 18) ──────────────────
 
 def filtered_entropy_loss(logits, threshold):
@@ -307,4 +408,8 @@ def _compute_rf(results, cfg):
 if __name__ == "__main__":
     cfg = get_cfg()
     set_seed(cfg.seed)
+  
+    # Print the distance table before starting
+    print_domain_distance_table(cfg, num_batches_to_sample=10)
+  
     adapt(cfg)
