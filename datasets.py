@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, datasets
 from PIL import Image
+import timm
 
 from config import (IMAGENET_C_CORRUPTIONS, CIFAR100_C_CORRUPTIONS,
                     CRS_DOMAINS)
