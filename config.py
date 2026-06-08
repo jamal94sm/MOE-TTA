@@ -75,6 +75,16 @@ def get_cfg(args=None):
     p.add_argument("--confidence_threshold", type=float, default=0.4,
                    help="κ coefficient: threshold = κ × ln(C)")
 
+    # anti-collapse fixes
+    p.add_argument("--entropy_floor", type=float, default=0.0,
+                   help="Skip update when entropy < this value "
+                        "(prevents reinforcing overconfident predictions). "
+                        "0 = disabled. Recommended: 0.05")
+    p.add_argument("--stochastic_restore", type=float, default=0.0,
+                   help="Probability of resetting each shared expert param "
+                        "to its initial value each step (CoTTA-style). "
+                        "0 = disabled. Recommended: 0.01")
+
     # misc
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
