@@ -40,11 +40,24 @@ class ImageNetCDataset(Dataset):
 
 
 def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
-                            num_workers=4, img_size=224):
+                            num_workers=4, img_size=224, corruptions=None):
     """
-    Returns a list of (corruption_name, DataLoader) pairs
-    in the standard CTTA order (15 corruptions).
+    Returns a list of (corruption_name, DataLoader) pairs.
+    corruptions: None  → all 15 standard corruptions
+                 list  → only the specified corruption(s)
     """
+    if corruptions:
+        # validate names
+        valid = set(IMAGENET_C_CORRUPTIONS)
+        for c in corruptions:
+            if c not in valid:
+                raise ValueError(
+                    f"Unknown corruption '{c}'. "
+                    f"Valid: {IMAGENET_C_CORRUPTIONS}")
+        run_corruptions = corruptions
+    else:
+        run_corruptions = IMAGENET_C_CORRUPTIONS
+
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
@@ -54,7 +67,7 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
     ])
 
     loaders = []
-    for corruption in IMAGENET_C_CORRUPTIONS:
+    for corruption in run_corruptions:
         ds = ImageNetCDataset(data_dir, corruption, severity, transform)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True,
@@ -263,7 +276,7 @@ def get_domain_sequence(cfg):
     if cfg.dataset == "imagenet_c":
         return get_imagenet_c_sequence(
             cfg.data_dir, cfg.severity, cfg.batch_size,
-            cfg.num_workers, cfg.img_size)
+            cfg.num_workers, cfg.img_size, cfg.corruptions)
 
     elif cfg.dataset == "cifar100_c":
         return get_cifar100_c_sequence(
