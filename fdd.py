@@ -51,9 +51,13 @@ class FrequencyDomainDiscriminator:
         B, H, W = gray.shape
 
         # 2D DFT + shift DC to centre
-        F = torch.fft.fft2(gray, norm="ortho")                      # [B, H, W] complex
+        F = torch.fft.fft2(gray)                       # [B, H, W] complex
         F_shifted = torch.fft.fftshift(F, dim=(-2, -1))
-        magnitude = F_shifted.abs()                   # [B, H, W]
+        magnitude = F_shifted.abs()                    # [B, H, W]
+
+        # log-scale to compress dynamic range (raw magnitudes ~10k,
+        # log1p brings them to ~10, making Mahalanobis distances meaningful)
+        magnitude = torch.log1p(magnitude)
 
         # crop low-frequency patch centred at DC
         cr, cc = H // 2, W // 2
@@ -68,8 +72,10 @@ class FrequencyDomainDiscriminator:
     # ─── Mahalanobis distance (Eq. 6, 9, Appendix B) ─────────────────
     def _mahalanobis(self, z, domain_id):
         """
-        Compute shrinkage-regularised Mahalanobis distance.
-        z: [df] descriptor
+        Compute shrinkage-regularised Mahalanobis distance,
+        normalised by dimensionality so that within-distribution
+        batch means score ~1.0 and the threshold τ=1.5 is meaningful.
+        z: [df] descriptor (batch mean)
         Returns scalar distance.
         """
         d = self.domains[domain_id]
@@ -78,14 +84,16 @@ class FrequencyDomainDiscriminator:
         if self.diagonal:
             # Σ_reg = (1-ε)diag(σ²) + εI
             sigma_reg = (1 - self.eps) * d["sigma"] + self.eps
-            dist = (diff ** 2 / sigma_reg).mean()  # <-- CHANGED TO MEAN
+            dist = (diff ** 2 / sigma_reg).sum()
         else:
             cov = d["sigma"]                             # [df, df]
             cov_reg = (1 - self.eps) * cov + self.eps * torch.eye(
                 self.df, device=cov.device)
-            dist = (diff @ torch.linalg.solve(cov_reg, diff)) / self.df # <-- AVERAGED
+            dist = diff @ torch.linalg.solve(cov_reg, diff)
 
-        return dist.item()
+        # normalise: raw Mahalanobis in d dimensions has E[m] ≈ d
+        # dividing by df makes within-distribution distances ≈ 1
+        return (dist / self.df).item()
 
     # ─── Domain matching (Eq. 8-9) ────────────────────────────────────
     @torch.no_grad()
@@ -99,7 +107,7 @@ class FrequencyDomainDiscriminator:
 
         if self.num_domains == 0:
             # first batch ever — initialise domain 0
-            self._init_domain(z_mean)
+            self._init_domain(z_mean, descs)
             return 0, True
 
         # compute Mahalanobis distance to each domain
@@ -114,17 +122,32 @@ class FrequencyDomainDiscriminator:
             return i_star, False
         else:
             # new domain detected
-            self._init_domain(z_mean)
+            self._init_domain(z_mean, descs)
             return self.num_domains - 1, True
 
     # ─── Initialise new domain (Eq. 15) ───────────────────────────────
-    def _init_domain(self, z_mean):
-        if self.diagonal:
-            sigma = torch.full((self.df,), self.sigma2_0,
-                               device=z_mean.device)
+    def _init_domain(self, z_mean, descriptors=None):
+        """
+        Initialise a new domain. If descriptors are provided, compute
+        the initial variance from the batch (data-driven). Otherwise
+        fall back to sigma2_0.
+        """
+        if descriptors is not None and descriptors.shape[0] > 1:
+            # data-driven: use batch variance + floor for stability
+            if self.diagonal:
+                sigma = descriptors.var(dim=0).clamp(min=self.sigma2_0)
+            else:
+                centered = descriptors - z_mean.unsqueeze(0)
+                sigma = (centered.T @ centered) / descriptors.shape[0]
+                sigma = sigma + self.sigma2_0 * torch.eye(
+                    self.df, device=sigma.device)
         else:
-            sigma = self.sigma2_0 * torch.eye(self.df,
-                                               device=z_mean.device)
+            if self.diagonal:
+                sigma = torch.full((self.df,), self.sigma2_0,
+                                   device=z_mean.device)
+            else:
+                sigma = self.sigma2_0 * torch.eye(self.df,
+                                                   device=z_mean.device)
         self.domains.append({
             "mu": z_mean.clone(),
             "sigma": sigma,
@@ -145,12 +168,12 @@ class FrequencyDomainDiscriminator:
         diffs = descriptors - d["mu"].unsqueeze(0)      # [B, df]
         if self.diagonal:
             sigma_reg = (1 - self.eps) * d["sigma"] + self.eps
-            dists = (diffs ** 2 / sigma_reg.unsqueeze(0)).mean(dim=1)  # <-- CHANGED TO MEAN
+            dists = (diffs ** 2 / sigma_reg.unsqueeze(0)).sum(dim=1)  # [B]
         else:
             cov_reg = ((1 - self.eps) * d["sigma"] +
                        self.eps * torch.eye(self.df, device=d["sigma"].device))
             dists = (diffs @ torch.linalg.solve(cov_reg, diffs.T)
-                     ).diag() / self.df                  # <-- AVERAGED
+                     ).diag()                            # [B]
 
         # normalised weights (Eq. 10)
         log_w = -0.5 * dists
