@@ -1,185 +1,200 @@
 """
-diagnose2.py — Follow-up: isolate the cause of entropy collapse.
-Tests 4 configurations over 200 batches each and plots the error trajectory.
+diagnose3.py — Detailed per-domain diagnostics.
+Prints collapse indicators: prediction diversity, filter pass rate,
+shared expert drift, and per-batch entropy distribution.
 
 Usage:
-  python diagnose2.py --data_dir ./data/ImageNet-C --corruptions gaussian_noise
+  python diagnose3.py --data_dir ./data/ImageNet-C --severity 5
 """
 
 import torch
 import torch.nn.functional as F
-import timm
 import numpy as np
-from tqdm import tqdm
+from collections import Counter
 
 from config import get_cfg
 from datasets import get_domain_sequence
 from model import build_model
-
-
-def run_adaptation(cfg, loader, device, label, lr_override=None,
-                   shared_only=False, domain_only=False,
-                   max_batches=200, disable_adaptation=False):
-    """
-    Run adaptation and track error every batch.
-    Returns list of per-batch error rates.
-    """
-    model = build_model(cfg)
-    model.expand_domain()
-    model.set_active_domain(0)
-
-    # optionally disable one branch
-    if shared_only:
-        # zero out domain expert contribution: set fusion_lambda=1.0
-        for em in model.expert_modules:
-            em.fusion_lambda = 1.0  # Z + 1.0*shared + 0.0*domain
-    elif domain_only:
-        for em in model.expert_modules:
-            em.fusion_lambda = 0.0  # Z + 0.0*shared + 1.0*domain
-
-    params = model.get_trainable_params()
-    lr = lr_override if lr_override is not None else cfg.lr
-
-    if not disable_adaptation:
-        optimizer = torch.optim.Adam(params, lr=lr, weight_decay=cfg.weight_decay)
-    else:
-        optimizer = None
-
-    errors = []
-    for i, (imgs, labels) in enumerate(loader):
-        if i >= max_batches:
-            break
-        imgs, labels = imgs.to(device), labels.to(device)
-
-        # forward
-        logits = model(imgs)
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
-
-        # error
-        preds = logits.argmax(dim=-1)
-        err = 100.0 * (1 - (preds == labels).float().mean().item())
-        errors.append(err)
-
-        # adapt (unless disabled)
-        mask = entropy < cfg.entropy_threshold
-        if mask.sum() > 0 and optimizer is not None:
-            loss = entropy[mask].mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        if i % 50 == 0:
-            avg_so_far = np.mean(errors)
-            print(f"  [{label}] batch {i:4d} | err={err:.1f}% | "
-                  f"running_avg={avg_so_far:.1f}%")
-
-    final_avg = np.mean(errors)
-    print(f"  [{label}] FINAL avg error over {len(errors)} batches: {final_avg:.1f}%")
-    return errors
+from fdd import FrequencyDomainDiscriminator
 
 
 def main():
     cfg = get_cfg()
     device = cfg.device
     domain_sequence = get_domain_sequence(cfg)
-    domain_name, loader = domain_sequence[0]
-    n_batches = 1000
 
-    print(f"Diagnosing collapse on: {domain_name}")
-    print(f"Running {n_batches} batches per configuration\n")
+    # build model + FDD
+    model = build_model(cfg)
+    fdd = FrequencyDomainDiscriminator(
+        freq_radius=cfg.fdd_freq_radius,
+        threshold=cfg.fdd_threshold,
+        shrinkage=cfg.fdd_shrinkage,
+        init_var=cfg.fdd_init_var,
+        diagonal=cfg.fdd_diagonal,
+        device=device,
+    )
 
-    results = {}
+    optimizer = None
+    current_fdd_domain = -1
 
-    # ─── Config A: No adaptation (frozen baseline) ────────────────────
-    print("=" * 60)
-    print("A: No adaptation (Source baseline, frozen)")
-    print("=" * 60)
-    results["A: No adaptation"] = run_adaptation(
-        cfg, loader, device, "no-adapt",
-        disable_adaptation=True, max_batches=n_batches)
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
-    # ─── Config B: Paper's lr=1e-5 (current setting) ─────────────────
-    print("\n" + "=" * 60)
-    print(f"B: Full adaptation, lr={cfg.lr}")
-    print("=" * 60)
-    results[f"B: lr={cfg.lr}"] = run_adaptation(
-        cfg, loader, device, f"lr={cfg.lr}",
-        max_batches=n_batches)
+    # ─── Save initial shared expert state for drift measurement ───
+    init_shared_norms = {}
+    for i, em in enumerate(model.expert_modules):
+        for name, p in em.shared_moe.named_parameters():
+            key = f"block{i}.shared.{name}"
+            init_shared_norms[key] = p.data.norm().item()
 
-    # ─── Config C: Much smaller lr ────────────────────────────────────
-    small_lr = cfg.lr * 0.1   # 1e-6
-    print("\n" + "=" * 60)
-    print(f"C: Full adaptation, lr={small_lr}")
-    print("=" * 60)
-    results[f"C: lr={small_lr}"] = run_adaptation(
-        cfg, loader, device, f"lr={small_lr}",
-        lr_override=small_lr, max_batches=n_batches)
+    print(f"\n{'='*80}")
+    print(f"  DETAILED DIAGNOSTIC: {len(domain_sequence)} domains")
+    print(f"  Entropy threshold κ = {cfg.entropy_threshold:.4f}")
+    print(f"{'='*80}\n")
 
-    # ─── Config D: Shared expert only (λ=1, no domain expert) ─────────
-    print("\n" + "=" * 60)
-    print(f"D: Shared expert only (λ=1.0), lr={cfg.lr}")
-    print("=" * 60)
-    results["D: Shared only"] = run_adaptation(
-        cfg, loader, device, "shared-only",
-        shared_only=True, max_batches=n_batches)
+    for seg_idx, (domain_name, loader) in enumerate(domain_sequence):
+        n_batches = len(loader)
 
-    # ─── Config E: Domain expert only (λ=0, no shared expert) ─────────
-    print("\n" + "=" * 60)
-    print(f"E: Domain expert only (λ=0.0), lr={cfg.lr}")
-    print("=" * 60)
-    results["E: Domain only"] = run_adaptation(
-        cfg, loader, device, "domain-only",
-        domain_only=True, max_batches=n_batches)
+        # ─── Per-domain accumulators ──
+        all_errors = []
+        all_entropies = []
+        all_filter_rates = []
+        all_pred_classes = []
+        updates_applied = 0
+        updates_skipped = 0
 
-    # ─── Config F: Larger lr (paper's ImageNet+ rate) ─────────────────
-    large_lr = 5e-4
-    print("\n" + "=" * 60)
-    print(f"F: Full adaptation, lr={large_lr}")
-    print("=" * 60)
-    results[f"F: lr={large_lr}"] = run_adaptation(
-        cfg, loader, device, f"lr={large_lr}",
-        lr_override=large_lr, max_batches=n_batches)
+        print(f"\n{'─'*80}")
+        print(f"  [{seg_idx+1}/{len(domain_sequence)}] {domain_name} "
+              f"({len(loader.dataset)} samples, {n_batches} batches)")
+        print(f"{'─'*80}")
 
-    # ─── Summary ──────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("SUMMARY: Average error over all batches")
-    print("=" * 60)
-    for name, errors in results.items():
-        avg = np.mean(errors)
-        first_50 = np.mean(errors[:50])
-        last_50 = np.mean(errors[-50:])
-        trend = "↑ collapsing" if last_50 > first_50 + 3 else \
-                "↓ improving" if last_50 < first_50 - 3 else "→ stable"
-        print(f"  {name:<30} avg={avg:5.1f}%  "
-              f"first50={first_50:5.1f}%  last50={last_50:5.1f}%  {trend}")
+        for batch_idx, (images, labels) in enumerate(loader):
+            images, labels = images.to(device), labels.to(device)
+            B = images.shape[0]
 
-    # ─── Save plot ────────────────────────────────────────────────────
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+            # ─── FDD ───
+            raw_images = images * imagenet_std + imagenet_mean
+            fdd_domain_id, is_new = fdd.detect_domain(raw_images)
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        for name, errors in results.items():
-            # smooth with rolling average for readability
-            window = 10
-            smoothed = np.convolve(errors, np.ones(window)/window, mode='valid')
-            ax.plot(smoothed, label=name, alpha=0.8)
+            if is_new:
+                expert_id = model.expand_domain()
+                model.set_active_domain(expert_id)
+                current_fdd_domain = fdd_domain_id
+                params = model.get_trainable_params()
+                optimizer = torch.optim.Adam(params, lr=cfg.lr,
+                                             weight_decay=cfg.weight_decay)
+                if batch_idx == 0:
+                    print(f"  [FDD] New domain {fdd_domain_id} → expert {expert_id}")
+            elif fdd_domain_id != current_fdd_domain:
+                model.set_active_domain(fdd_domain_id)
+                current_fdd_domain = fdd_domain_id
+                params = model.get_trainable_params()
+                optimizer = torch.optim.Adam(params, lr=cfg.lr,
+                                             weight_decay=cfg.weight_decay)
+                if batch_idx < 5:  # only print first few switches
+                    print(f"  [FDD] Switched to domain {fdd_domain_id} at batch {batch_idx}")
 
-        ax.set_xlabel("Batch")
-        ax.set_ylabel("Error (%)")
-        ax.set_title(f"Adaptation dynamics on {domain_name} — {n_batches} batches")
-        ax.legend(loc="upper right", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 100)
+            # ─── Forward ───
+            logits = model(images)
+            probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [B]
+            preds = logits.argmax(dim=-1)
 
-        fig.tight_layout()
-        fig.savefig("diagnose2_collapse.png", dpi=150)
-        plt.close(fig)
-        print(f"\n  Plot saved: diagnose2_collapse.png")
-    except Exception as e:
-        print(f"\n  Could not save plot: {e}")
+            # ─── Metrics ───
+            err = 100.0 * (1 - (preds == labels).float().mean().item())
+            all_errors.append(err)
+            all_entropies.append(entropy.mean().item())
+
+            # prediction diversity: how many unique classes predicted?
+            unique_preds = len(set(preds.cpu().tolist()))
+            all_pred_classes.append(unique_preds)
+
+            # filter pass rate
+            mask = entropy < cfg.entropy_threshold
+            pass_rate = mask.float().mean().item() * 100
+            all_filter_rates.append(pass_rate)
+
+            # ─── Update (only if confident samples exist) ───
+            if mask.sum() > 0 and optimizer is not None:
+                loss = entropy[mask].mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                updates_applied += 1
+            else:
+                updates_skipped += 1
+
+            # ─── Print detailed info for first 5 and every 200th batch ───
+            if batch_idx < 5 or batch_idx % 200 == 0 or batch_idx == n_batches - 1:
+                # most common prediction
+                pred_counts = Counter(preds.cpu().tolist())
+                top_pred, top_count = pred_counts.most_common(1)[0]
+                top_pct = 100 * top_count / B
+
+                print(f"    batch {batch_idx:4d} | err={err:5.1f}% | "
+                      f"H={entropy.mean().item():.3f} | "
+                      f"filter={pass_rate:5.1f}% | "
+                      f"unique_preds={unique_preds:3d}/1000 | "
+                      f"top_pred=cls{top_pred}({top_pct:.0f}%)")
+
+        # ─── Domain summary ───
+        avg_err = np.mean(all_errors)
+        avg_H = np.mean(all_entropies)
+        avg_filter = np.mean(all_filter_rates)
+        avg_diversity = np.mean(all_pred_classes)
+
+        # error trend: first vs last quarter
+        q = len(all_errors) // 4
+        if q > 0:
+            first_q_err = np.mean(all_errors[:q])
+            last_q_err = np.mean(all_errors[-q:])
+            trend = last_q_err - first_q_err
+        else:
+            first_q_err = last_q_err = avg_err
+            trend = 0
+
+        # shared expert drift
+        drift_total = 0
+        drift_count = 0
+        for i, em in enumerate(model.expert_modules):
+            for name, p in em.shared_moe.named_parameters():
+                key = f"block{i}.shared.{name}"
+                if key in init_shared_norms:
+                    drift = abs(p.data.norm().item() - init_shared_norms[key])
+                    drift_total += drift
+                    drift_count += 1
+        avg_drift = drift_total / max(drift_count, 1)
+
+        print(f"\n  ┌── DOMAIN SUMMARY: {domain_name}")
+        print(f"  │ Avg Error:        {avg_err:.1f}%")
+        print(f"  │ Avg Entropy:      {avg_H:.3f}  "
+              f"(threshold κ={cfg.entropy_threshold:.3f})")
+        print(f"  │ Avg Filter Rate:  {avg_filter:.1f}% of samples pass κ")
+        print(f"  │ Avg Pred Diversity:{avg_diversity:.0f} unique classes / batch")
+        print(f"  │ Error Trend:      first25%={first_q_err:.1f}% → "
+              f"last25%={last_q_err:.1f}% (Δ={trend:+.1f}%)")
+        print(f"  │ Updates:          {updates_applied} applied, "
+              f"{updates_skipped} skipped (no confident samples)")
+        print(f"  │ Shared Expert Drift: {avg_drift:.4f} "
+              f"(avg param norm change from init)")
+        print(f"  │ FDD Domain:       {current_fdd_domain} "
+              f"(total discovered: {fdd.num_domains})")
+
+        # ─── Collapse warning ───
+        if avg_diversity < 10:
+            print(f"  │ ⚠ COLLAPSE: model predicts <10 unique classes!")
+        if avg_H < 0.1:
+            print(f"  │ ⚠ COLLAPSE: entropy near zero (overconfident)")
+        if avg_filter > 95 and avg_err > 80:
+            print(f"  │ ⚠ COLLAPSE: filter passes everything but error is high "
+                  f"(confidently wrong)")
+        if trend > 10:
+            print(f"  │ ⚠ DEGRADING: error increased {trend:+.1f}% within domain")
+        print(f"  └{'─'*60}")
+
+    print(f"\n{'='*80}")
+    print(f"  DIAGNOSTIC COMPLETE")
+    print(f"{'='*80}")
 
 
 if __name__ == "__main__":
