@@ -158,7 +158,7 @@ def filtered_entropy_loss(logits, threshold):
     mask = (entropy < threshold).float()                 # [B]
 
     if mask.sum() == 0:
-        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        return torch.tensor(0.0, device=logits.device)   # ← no requires_grad needed
 
     # mean entropy over reliable samples
     loss = (entropy * mask).sum() / mask.sum()
@@ -301,7 +301,7 @@ def adapt(cfg):
             loss = filtered_entropy_loss(logits, cfg.entropy_threshold)
 
             # ─── Step 6: Backward + update ───
-            if optimizer is not None and loss.requires_grad:
+            if optimizer is not None and loss.item() > 0:    # ← only update when there's signal
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
