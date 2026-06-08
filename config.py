@@ -59,7 +59,7 @@ def get_cfg(args=None):
     # FDD (Section 3.3)
     p.add_argument("--fdd_freq_radius", type=int, default=16,
                    help="l: frequency radius for low-freq crop")
-    p.add_argument("--fdd_threshold", type=float, default=1.5,
+    p.add_argument("--fdd_threshold", type=float, default=5,
                    help="τ: Mahalanobis threshold for new domain")
     p.add_argument("--fdd_shrinkage", type=float, default=0.1,
                    help="ε: covariance shrinkage")
