@@ -62,12 +62,9 @@ def run_adaptation(cfg, loader, device, label, lr_override=None,
         errors.append(err)
 
         # adapt (unless disabled)
-        if optimizer is not None:
-            mask = entropy < cfg.entropy_threshold
-            if mask.sum() > 0:
-                loss = entropy[mask].mean()
-            else:
-                loss = entropy.mean()
+        mask = entropy < cfg.entropy_threshold
+        if mask.sum() > 0:
+            loss = entropy[mask].mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
