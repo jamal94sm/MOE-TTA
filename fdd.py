@@ -53,7 +53,7 @@ class FrequencyDomainDiscriminator:
         # 2D DFT + shift DC to centre
         F = torch.fft.fft2(gray, norm="ortho")                      # [B, H, W] complex
         F_shifted = torch.fft.fftshift(F, dim=(-2, -1))
-        magnitude = F_shifted.abs()                    # [B, H, W]
+        magnitude = torch.log1p(F_shifted.abs()) # log(1 + x) squashes the massive FFT peaks                   # [B, H, W]
 
         # crop low-frequency patch centred at DC
         cr, cc = H // 2, W // 2
