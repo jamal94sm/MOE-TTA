@@ -234,7 +234,8 @@ def adapt(cfg):
             mean = imagenet_mean.to(cfg.device)
             std = imagenet_std.to(cfg.device)
             raw_images = images * std + mean             # [B, 3, H, W] ~[0,1]
-
+          
+            '''
             # --- FDD DEBUG SNIPPET ---
             if fdd.num_domains > 0:
                 with torch.no_grad():
@@ -245,6 +246,7 @@ def adapt(cfg):
                     dc_mag = tmp_z_mean[fdd.df // 2].item()
                     print(f"  [DEBUG] DC Mag: {dc_mag:.4f} | Mahalanobis Dist: {dist:.4f} | Threshold: {fdd.tau}")
             # -------------------------
+            '''
           
             fdd_domain_id, is_new = fdd.detect_domain(raw_images)
 
