@@ -19,7 +19,7 @@ from model import build_model
 
 def run_adaptation(cfg, loader, device, label, lr_override=None,
                    shared_only=False, domain_only=False,
-                   max_batches=200, disable_adaptation=False):
+                   max_batches=1000, disable_adaptation=False):
     """
     Run adaptation and track error every batch.
     Returns list of per-batch error rates.
