@@ -145,12 +145,12 @@ class FrequencyDomainDiscriminator:
         diffs = descriptors - d["mu"].unsqueeze(0)      # [B, df]
         if self.diagonal:
             sigma_reg = (1 - self.eps) * d["sigma"] + self.eps
-            dists = (diffs ** 2 / sigma_reg.unsqueeze(0)).sum(dim=1)  # [B]
+            dists = (diffs ** 2 / sigma_reg.unsqueeze(0)).mean(dim=1)  # <-- CHANGED TO MEAN
         else:
             cov_reg = ((1 - self.eps) * d["sigma"] +
                        self.eps * torch.eye(self.df, device=d["sigma"].device))
             dists = (diffs @ torch.linalg.solve(cov_reg, diffs.T)
-                     ).diag()                            # [B]
+                     ).diag() / self.df                  # <-- AVERAGED
 
         # normalised weights (Eq. 10)
         log_w = -0.5 * dists
