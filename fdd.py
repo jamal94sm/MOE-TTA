@@ -51,7 +51,7 @@ class FrequencyDomainDiscriminator:
         B, H, W = gray.shape
 
         # 2D DFT + shift DC to centre
-        F = torch.fft.fft2(gray)                       # [B, H, W] complex
+        F = torch.fft.fft2(gray, norm="ortho")                      # [B, H, W] complex
         F_shifted = torch.fft.fftshift(F, dim=(-2, -1))
         magnitude = F_shifted.abs()                    # [B, H, W]
 
