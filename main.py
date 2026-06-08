@@ -412,6 +412,6 @@ if __name__ == "__main__":
     set_seed(cfg.seed)
   
     # Print the distance table before starting
-    print_domain_distance_table(cfg, num_batches_to_sample=10)
+    print_domain_distance_table(cfg, num_batches_to_sample=100)
   
     adapt(cfg)
