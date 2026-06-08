@@ -121,7 +121,7 @@ def get_cifar100_c_sequence(data_dir, severity=5, batch_size=50,
     loaders = []
     for corruption in CIFAR100_C_CORRUPTIONS:
         ds = CIFAR100CDataset(data_dir, corruption, severity, transform)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True, ## was False
                             num_workers=num_workers, pin_memory=True)
         loaders.append((corruption, loader))
 
