@@ -19,7 +19,7 @@ from model import build_model
 
 def run_adaptation(cfg, loader, device, label, lr_override=None,
                    shared_only=False, domain_only=False,
-                   max_batches=1000, disable_adaptation=False):
+                   max_batches=200, disable_adaptation=False):
     """
     Run adaptation and track error every batch.
     Returns list of per-batch error rates.
@@ -87,7 +87,7 @@ def main():
     device = cfg.device
     domain_sequence = get_domain_sequence(cfg)
     domain_name, loader = domain_sequence[0]
-    n_batches = 200
+    n_batches = 1000
 
     print(f"Diagnosing collapse on: {domain_name}")
     print(f"Running {n_batches} batches per configuration\n")
