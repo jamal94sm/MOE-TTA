@@ -134,6 +134,17 @@ def adapt(cfg):
             std = imagenet_std.to(cfg.device)
             raw_images = images * std + mean             # [B, 3, H, W] ~[0,1]
 
+            # --- FDD DEBUG SNIPPET ---
+            if fdd.num_domains > 0:
+                with torch.no_grad():
+                    tmp_descs = fdd.extract_descriptor(raw_images)
+                    tmp_z_mean = tmp_descs.mean(dim=0)
+                    target_id = current_fdd_domain if current_fdd_domain >= 0 else 0
+                    dist = fdd._mahalanobis(tmp_z_mean, target_id)
+                    dc_mag = tmp_z_mean[fdd.df // 2].item()
+                    print(f"  [DEBUG] DC Mag: {dc_mag:.4f} | Mahalanobis Dist: {dist:.4f} | Threshold: {fdd.tau}")
+            # -------------------------
+          
             fdd_domain_id, is_new = fdd.detect_domain(raw_images)
 
             # ─── Step 2-3: Expand or activate domain expert ───
