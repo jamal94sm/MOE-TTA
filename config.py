@@ -32,6 +32,10 @@ def get_cfg(args=None):
                             "imagenet_plus", "imagenet_plusplus", "acdc"])
     p.add_argument("--data_dir", default="./data/ImageNet-C")
     p.add_argument("--severity", type=int, default=5)
+    p.add_argument("--corruptions", nargs="*", default=None,
+                   help="Corruption(s) to run. None=all 15. "
+                        "Examples: --corruptions glass_blur | "
+                        "--corruptions glass_blur defocus_blur fog")
     p.add_argument("--batch_size", type=int, default=50)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--num_rounds", type=int, default=3,
