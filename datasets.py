@@ -40,7 +40,8 @@ class ImageNetCDataset(Dataset):
 
 
 def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
-                            num_workers=4, img_size=224, corruptions=None):
+                            num_workers=4, img_size=224, corruptions=None,
+                            backbone_name="vit_base_patch16_224"):
     """
     Returns a list of (corruption_name, DataLoader) pairs.
     corruptions: None  → all 15 standard corruptions
@@ -58,6 +59,9 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
     else:
         run_corruptions = IMAGENET_C_CORRUPTIONS
 
+
+                              
+    '''
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
@@ -65,6 +69,14 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
+    '''
+    # use timm's recommended transform for this specific checkpoint
+    model = timm.create_model(backbone_name, pretrained=False)
+    data_cfg = timm.data.resolve_model_data_config(model)
+    transform = timm.data.create_transform(**data_cfg, is_training=False)
+    del model  # don't need the model, just the transform
+
+                              
 
     loaders = []
     for corruption in run_corruptions:
