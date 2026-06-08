@@ -1,10 +1,20 @@
 """
-diagnose3.py — Detailed per-domain diagnostics.
+diagnose3.py — Detailed per-domain diagnostics with anti-collapse fixes.
 Prints collapse indicators: prediction diversity, filter pass rate,
 shared expert drift, and per-batch entropy distribution.
 
 Usage:
+  # Without fixes (reproduce collapse):
   python diagnose3.py --data_dir ./data/ImageNet-C --severity 5
+
+  # With entropy floor only:
+  python diagnose3.py --data_dir ./data/ImageNet-C --severity 5 --entropy_floor 0.05
+
+  # With stochastic restore only:
+  python diagnose3.py --data_dir ./data/ImageNet-C --severity 5 --stochastic_restore 0.01
+
+  # With both fixes:
+  python diagnose3.py --data_dir ./data/ImageNet-C --severity 5 --entropy_floor 0.05 --stochastic_restore 0.01
 """
 
 import torch
@@ -40,16 +50,21 @@ def main():
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
 
-    # ─── Save initial shared expert state for drift measurement ───
+    # ─── Save initial shared expert state ───
+    # For drift measurement (always) and stochastic restore (if enabled)
+    init_shared_state = {}
     init_shared_norms = {}
     for i, em in enumerate(model.expert_modules):
         for name, p in em.shared_moe.named_parameters():
             key = f"block{i}.shared.{name}"
+            init_shared_state[key] = p.data.clone()
             init_shared_norms[key] = p.data.norm().item()
 
     print(f"\n{'='*80}")
     print(f"  DETAILED DIAGNOSTIC: {len(domain_sequence)} domains")
     print(f"  Entropy threshold κ = {cfg.entropy_threshold:.4f}")
+    print(f"  Entropy floor       = {cfg.entropy_floor}")
+    print(f"  Stochastic restore  = {cfg.stochastic_restore}")
     print(f"{'='*80}\n")
 
     for seg_idx, (domain_name, loader) in enumerate(domain_sequence):
@@ -62,6 +77,7 @@ def main():
         all_pred_classes = []
         updates_applied = 0
         updates_skipped = 0
+        floor_filtered = 0
 
         print(f"\n{'─'*80}")
         print(f"  [{seg_idx+1}/{len(domain_sequence)}] {domain_name} "
@@ -91,7 +107,7 @@ def main():
                 params = model.get_trainable_params()
                 optimizer = torch.optim.Adam(params, lr=cfg.lr,
                                              weight_decay=cfg.weight_decay)
-                if batch_idx < 5:  # only print first few switches
+                if batch_idx < 5:
                     print(f"  [FDD] Switched to domain {fdd_domain_id} at batch {batch_idx}")
 
             # ─── Forward ───
@@ -105,28 +121,46 @@ def main():
             all_errors.append(err)
             all_entropies.append(entropy.mean().item())
 
-            # prediction diversity: how many unique classes predicted?
             unique_preds = len(set(preds.cpu().tolist()))
             all_pred_classes.append(unique_preds)
 
-            # filter pass rate
+            # ─── Confidence filter with entropy floor ───
             mask = entropy < cfg.entropy_threshold
+            if cfg.entropy_floor > 0:
+                floor_mask = entropy > cfg.entropy_floor
+                n_floor_rejected = int((mask & ~floor_mask).sum().item())
+                floor_filtered += n_floor_rejected
+                mask = mask & floor_mask
+
             pass_rate = mask.float().mean().item() * 100
             all_filter_rates.append(pass_rate)
 
-            # ─── Update (only if confident samples exist) ───
+            # ─── Update (only if confident-but-not-overconfident samples exist) ───
             if mask.sum() > 0 and optimizer is not None:
                 loss = entropy[mask].mean()
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 updates_applied += 1
+
+                # ─── Stochastic restore of shared expert ───
+                if cfg.stochastic_restore > 0:
+                    with torch.no_grad():
+                        for i, em in enumerate(model.expert_modules):
+                            for name, p in em.shared_moe.named_parameters():
+                                key = f"block{i}.shared.{name}"
+                                if key in init_shared_state:
+                                    rst_mask = (torch.rand_like(p) <
+                                                cfg.stochastic_restore)
+                                    p.data = torch.where(
+                                        rst_mask,
+                                        init_shared_state[key],
+                                        p.data)
             else:
                 updates_skipped += 1
 
-            # ─── Print detailed info for first 5 and every 200th batch ───
+            # ─── Print detailed info ───
             if batch_idx < 5 or batch_idx % 200 == 0 or batch_idx == n_batches - 1:
-                # most common prediction
                 pred_counts = Counter(preds.cpu().tolist())
                 top_pred, top_count = pred_counts.most_common(1)[0]
                 top_pct = 100 * top_count / B
@@ -143,7 +177,6 @@ def main():
         avg_filter = np.mean(all_filter_rates)
         avg_diversity = np.mean(all_pred_classes)
 
-        # error trend: first vs last quarter
         q = len(all_errors) // 4
         if q > 0:
             first_q_err = np.mean(all_errors[:q])
@@ -169,25 +202,30 @@ def main():
         print(f"  │ Avg Error:        {avg_err:.1f}%")
         print(f"  │ Avg Entropy:      {avg_H:.3f}  "
               f"(threshold κ={cfg.entropy_threshold:.3f})")
-        print(f"  │ Avg Filter Rate:  {avg_filter:.1f}% of samples pass κ")
+        print(f"  │ Avg Filter Rate:  {avg_filter:.1f}% of samples pass band "
+              f"[{cfg.entropy_floor}, {cfg.entropy_threshold:.3f})")
         print(f"  │ Avg Pred Diversity:{avg_diversity:.0f} unique classes / batch")
         print(f"  │ Error Trend:      first25%={first_q_err:.1f}% → "
               f"last25%={last_q_err:.1f}% (Δ={trend:+.1f}%)")
         print(f"  │ Updates:          {updates_applied} applied, "
-              f"{updates_skipped} skipped (no confident samples)")
+              f"{updates_skipped} skipped")
+        if cfg.entropy_floor > 0:
+            print(f"  │ Floor-filtered:   {floor_filtered} samples rejected "
+                  f"(H < {cfg.entropy_floor})")
+        if cfg.stochastic_restore > 0:
+            print(f"  │ Stochastic restore: p={cfg.stochastic_restore} per step")
         print(f"  │ Shared Expert Drift: {avg_drift:.4f} "
               f"(avg param norm change from init)")
         print(f"  │ FDD Domain:       {current_fdd_domain} "
               f"(total discovered: {fdd.num_domains})")
 
-        # ─── Collapse warning ───
+        # ─── Collapse warnings ───
         if avg_diversity < 10:
             print(f"  │ ⚠ COLLAPSE: model predicts <10 unique classes!")
         if avg_H < 0.1:
             print(f"  │ ⚠ COLLAPSE: entropy near zero (overconfident)")
         if avg_filter > 95 and avg_err > 80:
-            print(f"  │ ⚠ COLLAPSE: filter passes everything but error is high "
-                  f"(confidently wrong)")
+            print(f"  │ ⚠ COLLAPSE: filter passes everything but error is high")
         if trend > 10:
             print(f"  │ ⚠ DEGRADING: error increased {trend:+.1f}% within domain")
         print(f"  └{'─'*60}")
