@@ -78,12 +78,12 @@ class FrequencyDomainDiscriminator:
         if self.diagonal:
             # Σ_reg = (1-ε)diag(σ²) + εI
             sigma_reg = (1 - self.eps) * d["sigma"] + self.eps
-            dist = (diff ** 2 / sigma_reg).sum()
+            dist = (diff ** 2 / sigma_reg).mean()  # <-- CHANGED TO MEAN
         else:
             cov = d["sigma"]                             # [df, df]
             cov_reg = (1 - self.eps) * cov + self.eps * torch.eye(
                 self.df, device=cov.device)
-            dist = diff @ torch.linalg.solve(cov_reg, diff)
+            dist = (diff @ torch.linalg.solve(cov_reg, diff)) / self.df # <-- AVERAGED
 
         return dist.item()
 
