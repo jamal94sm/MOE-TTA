@@ -69,7 +69,7 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
     loaders = []
     for corruption in run_corruptions:
         ds = ImageNetCDataset(data_dir, corruption, severity, transform)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True, # was False
                             num_workers=num_workers, pin_memory=True,
                             drop_last=False)
         loaders.append((corruption, loader))
