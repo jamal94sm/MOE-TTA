@@ -66,17 +66,17 @@ def get_cfg(args=None):
     p.add_argument("--fdd_init_var", type=float, default=1.0,
                    help="σ²₀: initial diagonal covariance for new domain")
     p.add_argument("--fdd_diagonal", action="store_true", default=True,
-                   help="Approximate covariance as diagonal (saves ~60%% GPU mem)")
+                   help="Approximate covariance as diagonal (saves ~60% GPU mem)")
 
     # optimisation (Section 3.4, Appendix F)
     p.add_argument("--lr", type=float, default=None,
                    help="Learning rate (auto-set per dataset if None)")
-    p.add_argument("--weight_decay", type=float, default=0.05)
+    p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--confidence_threshold", type=float, default=0.4,
                    help="κ coefficient: threshold = κ × ln(C)")
 
     # anti-collapse fixes
-    p.add_argument("--entropy_floor", type=float, default=0.0,
+    p.add_argument("--entropy_floor", type=float, default=0.05,
                    help="Skip update when entropy < this value "
                         "(prevents reinforcing overconfident predictions). "
                         "0 = disabled. Recommended: 0.05")
@@ -84,7 +84,7 @@ def get_cfg(args=None):
                    help="Probability of resetting each shared expert param "
                         "to its initial value each step (CoTTA-style). "
                         "0 = disabled. Recommended: 0.01")
-    p.add_argument("--div_lambda", type=float, default=0.0,
+    p.add_argument("--div_lambda", type=float, default=0.2,
                    help="Batch diversity regularizer weight (IM loss). "
                         "Maximizes entropy of batch-mean prediction to prevent "
                         "single-class collapse. 0 = disabled. Recommended: 1.0")
