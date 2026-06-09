@@ -90,6 +90,8 @@ def get_cfg(args=None):
                         "single-class collapse. 0 = disabled. Recommended: 1.0")
 
     # misc
+    p.add_argument("--eval_backbone", action="store_true", default=False,
+               help="Evaluate frozen backbone on each domain before adaptation")
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
     p.add_argument("--output_dir", default="./output")
