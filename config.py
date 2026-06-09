@@ -84,6 +84,10 @@ def get_cfg(args=None):
                    help="Probability of resetting each shared expert param "
                         "to its initial value each step (CoTTA-style). "
                         "0 = disabled. Recommended: 0.01")
+    p.add_argument("--div_lambda", type=float, default=0.0,
+                   help="Batch diversity regularizer weight (IM loss). "
+                        "Maximizes entropy of batch-mean prediction to prevent "
+                        "single-class collapse. 0 = disabled. Recommended: 1.0")
 
     # misc
     p.add_argument("--seed", type=int, default=2025)
