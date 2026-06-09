@@ -37,16 +37,20 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
-# ─── Entropy loss with confidence filtering (Eq. 18) ──────────────────
+# ─── Entropy loss with confidence filtering (Eq. 18) + diversity ──────
 
-def filtered_entropy_loss(logits, threshold, entropy_floor=0.0):
+def filtered_entropy_loss(logits, threshold, entropy_floor=0.0, div_lambda=0.0):
     """
-    L_TTA = -𝟙{floor < H(ŷ) < κ} Σ ŷ_c log ŷ_c
+    L = L_ent + λ_div × L_div
+
+    L_ent: filtered per-sample entropy minimization (Eq. 18)
+    L_div: batch diversity — negative entropy of mean prediction (IM loss)
 
     logits:        [B, C] raw logits
     threshold:     κ = 0.4 × ln(C)  (ceiling: skip uncertain samples)
     entropy_floor: skip overconfident samples (prevents collapse reinforcement)
-    Returns: scalar loss (mean over reliable samples), or 0 if none pass
+    div_lambda:    weight for diversity term (0 = disabled)
+    Returns: scalar loss, or 0 if no samples pass the filter
     """
     probs = F.softmax(logits, dim=-1)
     log_probs = F.log_softmax(logits, dim=-1)
@@ -62,9 +66,16 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0):
     if mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
 
-    # mean entropy over reliable samples
-    loss = (entropy * mask).sum() / mask.sum()
-    return loss
+    # per-sample entropy minimization (filtered)
+    ent_loss = (entropy * mask).sum() / mask.sum()
+
+    # batch diversity: maximize entropy of mean prediction (all samples)
+    if div_lambda > 0:
+        batch_mean_prob = probs.mean(dim=0)              # [C]
+        div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum()
+        return ent_loss + div_lambda * div_loss
+
+    return ent_loss
 
 
 # ─── Main adaptation loop ────────────────────────────────────────────
@@ -105,7 +116,8 @@ def adapt(cfg):
 
     # ── anti-collapse settings ──
     print(f"[Anti-collapse] entropy_floor={cfg.entropy_floor}, "
-          f"stochastic_restore={cfg.stochastic_restore}")
+          f"stochastic_restore={cfg.stochastic_restore}, "
+          f"div_lambda={cfg.div_lambda}")
     print(f"[Optimizer] Constant LR={cfg.lr}, weight_decay={cfg.weight_decay}")
 
     # ── save initial shared expert state (for stochastic restore) ──
@@ -198,7 +210,7 @@ def adapt(cfg):
 
             # ─── Step 5: Compute filtered entropy loss (Eq. 18) ───
             loss = filtered_entropy_loss(logits, cfg.entropy_threshold,
-                                         cfg.entropy_floor)
+                                         cfg.entropy_floor, cfg.div_lambda)
 
             # ─── Step 6: Backward + update ───
             if optimizer is not None and loss.item() > 0:
