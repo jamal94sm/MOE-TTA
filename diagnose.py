@@ -56,6 +56,7 @@ def main():
     print(f"  Entropy threshold κ = {cfg.entropy_threshold:.4f}")
     print(f"  Entropy floor       = {cfg.entropy_floor}")
     print(f"  Stochastic restore  = {cfg.stochastic_restore}")
+    print(f"  Diversity lambda    = {cfg.div_lambda}")
     print(f"  Optimizer: Constant LR={cfg.lr}, weight_decay={cfg.weight_decay}")
     print(f"  Total batches: {total_batches}")
     print(f"{'='*90}")
@@ -168,7 +169,18 @@ def main():
             pass_rate = mask.float().mean().item() * 100
 
             if mask.sum() > 0 and optimizer is not None:
-                loss = entropy[mask].mean()
+                # per-sample entropy (filtered)
+                ent_loss = entropy[mask].mean()
+
+                # batch diversity regularizer (all samples)
+                if cfg.div_lambda > 0:
+                    batch_mean_prob = probs.mean(dim=0)
+                    div_loss = (batch_mean_prob * torch.log(
+                        batch_mean_prob + 1e-8)).sum()
+                    loss = ent_loss + cfg.div_lambda * div_loss
+                else:
+                    loss = ent_loss
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
