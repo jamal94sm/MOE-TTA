@@ -8,7 +8,7 @@ Prints every 20 batches and tracks:
   - Constant LR with persistent optimizer (preserves Adam momentum)
 
 Usage:
-  python diagnose.py --data_dir ./data/ImageNet-C --severity 5 --entropy_floor 0.05
+  python diagnose4.py --data_dir ./data/ImageNet-C --severity 5 --entropy_floor 0.05
 """
 
 import torch
@@ -62,25 +62,27 @@ def main():
     print(f"{'='*90}")
 
     # ─── Evaluate frozen backbone (source baseline) ───────────────────
-    print(f"\n  Evaluating frozen backbone on each domain...")
+    eval_bb = getattr(cfg, 'eval_backbone', False)
     baseline_errors = {}
-    model.eval()
-    with torch.no_grad():
-        for domain_name, loader in domain_sequence:
-            correct = 0
-            total = 0
-            for images, labels in loader:
-                images, labels = images.to(device), labels.to(device)
-                # forward through backbone only (no experts)
-                logits = model.backbone(images)
-                preds = logits.argmax(dim=-1)
-                correct += (preds == labels).sum().item()
-                total += labels.shape[0]
-            err = 100.0 * (1 - correct / total)
-            baseline_errors[domain_name] = err
-            print(f"    {domain_name:25s} → {err:.1f}%")
-    print(f"  Backbone mean error: "
-          f"{np.mean(list(baseline_errors.values())):.1f}%\n")
+    if eval_bb:
+        print(f"\n  Evaluating frozen backbone on each domain...")
+        model.eval()
+        with torch.no_grad():
+            for domain_name, loader in domain_sequence:
+                correct = 0
+                total = 0
+                for images, labels in loader:
+                    images, labels = images.to(device), labels.to(device)
+                    # forward through backbone only (no experts)
+                    logits = model.backbone(images)
+                    preds = logits.argmax(dim=-1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.shape[0]
+                err = 100.0 * (1 - correct / total)
+                baseline_errors[domain_name] = err
+                print(f"    {domain_name:25s} → {err:.1f}%")
+        print(f"  Backbone mean error: "
+              f"{np.mean(list(baseline_errors.values())):.1f}%\n")
 
     tta_errors = {}  # domain_name → avg TTA error
 
@@ -274,26 +276,40 @@ def main():
 
     # ─── Final comparison table ──────────────────────────────────────────
     print(f"\n{'='*90}")
-    print(f"  FINAL COMPARISON: Backbone vs TTA")
-    print(f"{'='*90}")
-    print(f"  {'Domain':<25} {'Backbone':>10} {'TTA':>10} {'Improv.':>10}")
-    print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}")
+    if baseline_errors:
+        print(f"  FINAL COMPARISON: Backbone vs TTA")
+        print(f"{'='*90}")
+        print(f"  {'Domain':<25} {'Backbone':>10} {'TTA':>10} {'Improv.':>10}")
+        print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}")
 
-    for domain_name, _ in domain_sequence:
-        b_err = baseline_errors.get(domain_name, 0)
-        t_err = tta_errors.get(domain_name, 0)
-        imp = b_err - t_err
-        arrow = "↓" if imp > 0 else "↑"
-        marker = " ⚠" if imp < -1 else ""
-        print(f"  {domain_name:<25} {b_err:>9.1f}% {t_err:>9.1f}% "
-              f"{arrow} {abs(imp):>7.1f}%{marker}")
+        for domain_name, _ in domain_sequence:
+            b_err = baseline_errors.get(domain_name, 0)
+            t_err = tta_errors.get(domain_name, 0)
+            imp = b_err - t_err
+            arrow = "↓" if imp > 0 else "↑"
+            marker = " ⚠" if imp < -1 else ""
+            print(f"  {domain_name:<25} {b_err:>9.1f}% {t_err:>9.1f}% "
+                  f"{arrow} {abs(imp):>7.1f}%{marker}")
 
-    backbone_mean = np.mean(list(baseline_errors.values()))
-    tta_mean = np.mean(list(tta_errors.values()))
-    mean_imp = backbone_mean - tta_mean
-    print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}")
-    print(f"  {'MEAN':<25} {backbone_mean:>9.1f}% {tta_mean:>9.1f}% "
-          f"{'↓' if mean_imp > 0 else '↑'} {abs(mean_imp):>7.1f}%")
+        backbone_mean = np.mean(list(baseline_errors.values()))
+        tta_mean = np.mean(list(tta_errors.values()))
+        mean_imp = backbone_mean - tta_mean
+        print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}")
+        print(f"  {'MEAN':<25} {backbone_mean:>9.1f}% {tta_mean:>9.1f}% "
+              f"{'↓' if mean_imp > 0 else '↑'} {abs(mean_imp):>7.1f}%")
+    else:
+        print(f"  FINAL RESULTS: TTA Adaptation Summary")
+        print(f"{'='*90}")
+        print(f"  {'Domain':<25} {'TTA Error':>12}")
+        print(f"  {'─'*25}─{'─'*12}")
+
+        for domain_name, _ in domain_sequence:
+            t_err = tta_errors.get(domain_name, 0)
+            print(f"  {domain_name:<25} {t_err:>11.1f}%")
+
+        tta_mean = np.mean(list(tta_errors.values()))
+        print(f"  {'─'*25}─{'─'*12}")
+        print(f"  {'MEAN':<25} {tta_mean:>11.1f}%")
     print(f"{'='*90}")
 
 
