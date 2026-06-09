@@ -110,6 +110,6 @@ def get_cfg(args=None):
         cfg.backbone = "vit_base_patch16_384"
 
     # ── entropy threshold κ × ln(C) ──
-    #cfg.entropy_threshold = cfg.confidence_threshold * math.log(cfg.num_classes)
-    cfg.entropy_threshold = cfg.confidence_threshold
+    cfg.entropy_threshold = cfg.confidence_threshold * math.log(cfg.num_classes)
+
     return cfg
