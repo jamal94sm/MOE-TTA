@@ -120,6 +120,26 @@ def adapt(cfg):
           f"div_lambda={cfg.div_lambda}")
     print(f"[Optimizer] Constant LR={cfg.lr}, weight_decay={cfg.weight_decay}")
 
+    # ── evaluate frozen backbone (source baseline) ──
+    print(f"\n[Baseline] Evaluating frozen backbone on each domain...")
+    baseline_errors = {}
+    model.eval()
+    with torch.no_grad():
+        for domain_name, loader in domain_sequence:
+            correct = 0
+            total = 0
+            for images, labels in loader:
+                images, labels = images.to(cfg.device), labels.to(cfg.device)
+                logits = model.backbone(images)
+                preds = logits.argmax(dim=-1)
+                correct += (preds == labels).sum().item()
+                total += labels.shape[0]
+            err = 100.0 * (1 - correct / total)
+            baseline_errors[domain_name] = err
+            print(f"  {domain_name:25s} → {err:.1f}%")
+    backbone_mean = np.mean(list(baseline_errors.values()))
+    print(f"[Baseline] Mean backbone error: {backbone_mean:.1f}%\n")
+
     # ── save initial shared expert state (for stochastic restore) ──
     shared_init_state = {}
     if cfg.stochastic_restore > 0:
@@ -257,40 +277,63 @@ def adapt(cfg):
             "time": elapsed,
         }
 
+        baseline_err = baseline_errors.get(domain_name, None)
+        imp_str = ""
+        if baseline_err is not None:
+            imp = baseline_err - seg_err
+            arrow = "↓" if imp > 0 else "↑"
+            imp_str = f" | Backbone: {baseline_err:.1f}% → {arrow}{abs(imp):.1f}%"
+
         print(f"  Error: {seg_err:.1f}% | Acc: {seg_acc:.1f}% | "
               f"Loss: {seg_loss_avg:.4f} | "
               f"FDD domains: {fdd.num_domains} | "
               f"LR: {cfg.lr:.2e} | "
-              f"Step: {global_step}/{total_batches} | "
+              f"Step: {global_step}/{total_batches}{imp_str} | "
               f"Time: {elapsed:.1f}s")
 
     # ─── Final summary ────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print("  FINAL RESULTS")
+    print("  FINAL RESULTS: Backbone vs TTA")
     print(f"{'='*70}")
 
-    mean_error = np.mean([r["error"] for r in results.values()])
-    mean_acc = np.mean([r["accuracy"] for r in results.values()])
-    print(f"  Mean Error: {mean_error:.2f}%")
-    print(f"  Mean Accuracy: {mean_acc:.2f}%")
-    print(f"  Total FDD domains discovered: {fdd.num_domains}")
+    print(f"\n  {'Domain':<25} {'Backbone':>10} {'TTA':>10} {'Improv.':>10} {'FDD':>5}")
+    print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}─{'─'*5}")
 
-    # per-domain breakdown
-    print(f"\n  Per-domain errors:")
     for name, r in results.items():
-        print(f"    {name:30s} → {r['error']:.1f}%  "
-              f"(FDD domain {r['fdd_domain']})")
+        b_err = baseline_errors.get(name, 0)
+        t_err = r["error"]
+        imp = b_err - t_err
+        arrow = "↓" if imp > 0 else "↑"
+        marker = " ⚠" if imp < -1 else ""
+        print(f"  {name:<25} {b_err:>9.1f}% {t_err:>9.1f}% "
+              f"{arrow} {abs(imp):>7.1f}%{marker:>3s} {r['fdd_domain']:>5d}")
+
+    mean_error = np.mean([r["error"] for r in results.values()])
+    backbone_mean = np.mean(list(baseline_errors.values()))
+    mean_imp = backbone_mean - mean_error
+    print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}─{'─'*5}")
+    print(f"  {'MEAN':<25} {backbone_mean:>9.1f}% {mean_error:>9.1f}% "
+          f"{'↓' if mean_imp > 0 else '↑'} {abs(mean_imp):>7.1f}%")
+
+    print(f"\n  Total FDD domains discovered: {fdd.num_domains}")
 
     # CRS-specific: compute Repeat Forget (RF) metric
     if cfg.dataset in ["imagenet_plus", "imagenet_plusplus"]:
         _compute_rf(results, cfg)
 
-    # save results
+    # save results (include baseline for comparison)
+    save_data = {
+        "baseline": baseline_errors,
+        "tta": results,
+        "mean_backbone_error": backbone_mean,
+        "mean_tta_error": mean_error,
+        "mean_improvement": mean_imp,
+    }
     os.makedirs(cfg.output_dir, exist_ok=True)
     out_path = os.path.join(cfg.output_dir,
                             f"{cfg.dataset}_seed{cfg.seed}.json")
     with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(save_data, f, indent=2)
     print(f"\n  Results saved to {out_path}")
 
     # domain mapping summary
