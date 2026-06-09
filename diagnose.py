@@ -61,6 +61,29 @@ def main():
     print(f"  Total batches: {total_batches}")
     print(f"{'='*90}")
 
+    # ─── Evaluate frozen backbone (source baseline) ───────────────────
+    print(f"\n  Evaluating frozen backbone on each domain...")
+    baseline_errors = {}
+    model.eval()
+    with torch.no_grad():
+        for domain_name, loader in domain_sequence:
+            correct = 0
+            total = 0
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                # forward through backbone only (no experts)
+                logits = model.backbone(images)
+                preds = logits.argmax(dim=-1)
+                correct += (preds == labels).sum().item()
+                total += labels.shape[0]
+            err = 100.0 * (1 - correct / total)
+            baseline_errors[domain_name] = err
+            print(f"    {domain_name:25s} → {err:.1f}%")
+    print(f"  Backbone mean error: "
+          f"{np.mean(list(baseline_errors.values())):.1f}%\n")
+
+    tta_errors = {}  # domain_name → avg TTA error
+
     hdr = (f"  {'batch':>5} │ {'err%':>5} │ {'H_mean':>6} │ {'H_p10':>5} │ "
            f"{'H_p50':>5} │ {'H_p90':>5} │ {'filt%':>5} │ {'uniq':>4} │ "
            f"{'top_cls':>7} │ {'top%':>4} │ {'H_correct':>9} │ {'H_wrong':>7} │ "
@@ -213,6 +236,7 @@ def main():
 
         # ─── Domain summary ───
         avg_err = np.mean(all_errors)
+        tta_errors[domain_name] = avg_err
         q = len(all_errors) // 4
         first_q = np.mean(all_errors[:q]) if q > 0 else avg_err
         last_q = np.mean(all_errors[-q:]) if q > 0 else avg_err
@@ -224,9 +248,19 @@ def main():
                 takeover_batch = b_idx
                 break
 
+        baseline_err = baseline_errors.get(domain_name, None)
         print(f"\n  ┌── SUMMARY: {domain_name}")
-        print(f"  │ Avg Error: {avg_err:.1f}%  "
-              f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, Δ={trend:+.1f}%)")
+        if baseline_err is not None:
+            improvement = baseline_err - avg_err
+            arrow = "↓" if improvement > 0 else "↑"
+            print(f"  │ Backbone Error:  {baseline_err:.1f}%")
+            print(f"  │ TTA Error:       {avg_err:.1f}%  "
+                  f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, Δ={trend:+.1f}%)")
+            print(f"  │ Improvement:     {arrow} {abs(improvement):.1f}%"
+                  f"{'  ⚠ TTA HURTS' if improvement < -1 else ''}")
+        else:
+            print(f"  │ Avg Error: {avg_err:.1f}%  "
+                  f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, Δ={trend:+.1f}%)")
         print(f"  │ Updates: {updates_applied} applied, {updates_skipped} skipped")
         print(f"  │ Step: {global_step}/{total_batches}")
         if takeover_batch is not None:
@@ -238,8 +272,28 @@ def main():
             print(f"  │ ⚠ DEGRADING within domain")
         print(f"  └{'─'*70}")
 
+    # ─── Final comparison table ──────────────────────────────────────────
     print(f"\n{'='*90}")
-    print(f"  DONE")
+    print(f"  FINAL COMPARISON: Backbone vs TTA")
+    print(f"{'='*90}")
+    print(f"  {'Domain':<25} {'Backbone':>10} {'TTA':>10} {'Improv.':>10}")
+    print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}")
+
+    for domain_name, _ in domain_sequence:
+        b_err = baseline_errors.get(domain_name, 0)
+        t_err = tta_errors.get(domain_name, 0)
+        imp = b_err - t_err
+        arrow = "↓" if imp > 0 else "↑"
+        marker = " ⚠" if imp < -1 else ""
+        print(f"  {domain_name:<25} {b_err:>9.1f}% {t_err:>9.1f}% "
+              f"{arrow} {abs(imp):>7.1f}%{marker}")
+
+    backbone_mean = np.mean(list(baseline_errors.values()))
+    tta_mean = np.mean(list(tta_errors.values()))
+    mean_imp = backbone_mean - tta_mean
+    print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}")
+    print(f"  {'MEAN':<25} {backbone_mean:>9.1f}% {tta_mean:>9.1f}% "
+          f"{'↓' if mean_imp > 0 else '↑'} {abs(mean_imp):>7.1f}%")
     print(f"{'='*90}")
 
 
