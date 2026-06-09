@@ -13,6 +13,7 @@ Algorithm per batch:
 
 import os
 import sys
+import math
 import time
 import json
 import random
@@ -20,7 +21,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from config import get_cfg
@@ -35,6 +35,15 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+
+
+# ─── Cosine LR helper (replaces CosineAnnealingLR) ───────────────────
+
+def cosine_lr(base_lr, step, total_steps):
+    """Compute LR at a given step using cosine annealing."""
+    if total_steps <= 0:
+        return base_lr
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
 
 
 # ─── Entropy loss with confidence filtering (Eq. 18) ──────────────────
@@ -57,7 +66,7 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0):
     # filter: keep samples in the safe band [floor, κ)
     mask = (entropy < threshold).float()                 # [B]
     if entropy_floor > 0:
-        mask = mask * (entropy > entropy_floor).float()  # also exclude overconfident
+        mask = mask * (entropy > entropy_floor).float()
 
     if mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
@@ -65,6 +74,18 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0):
     # mean entropy over reliable samples
     loss = (entropy * mask).sum() / mask.sum()
     return loss
+
+
+# ─── Build optimizer for current trainable params ─────────────────────
+
+def make_optimizer(model, cfg, current_lr):
+    """Create Adam optimizer for currently trainable params at given LR."""
+    params = model.get_trainable_params()
+    if not params:
+        return None
+    return Adam(params, lr=current_lr,
+                betas=(0.9, 0.999),
+                weight_decay=cfg.weight_decay)
 
 
 # ─── Main adaptation loop ────────────────────────────────────────────
@@ -99,11 +120,17 @@ def adapt(cfg):
 
     # ── build domain sequence ──
     domain_sequence = get_domain_sequence(cfg)
-    print(f"[Data] {len(domain_sequence)} domain segments")
+    total_batches = sum(len(loader) for _, loader in domain_sequence)
+    print(f"[Data] {len(domain_sequence)} domain segments, "
+          f"{total_batches} total batches")
 
     # ── anti-collapse settings ──
     print(f"[Anti-collapse] entropy_floor={cfg.entropy_floor}, "
           f"stochastic_restore={cfg.stochastic_restore}")
+
+    # ── cosine schedule over entire stream ──
+    print(f"[Scheduler] Cosine annealing over {total_batches} total batches "
+          f"(LR: {cfg.lr} → 0)")
 
     # ── save initial shared expert state (for stochastic restore) ──
     shared_init_state = {}
@@ -112,19 +139,16 @@ def adapt(cfg):
             for name, p in em.shared_moe.named_parameters():
                 shared_init_state[f"{i}.{name}"] = p.data.clone()
 
-    # ── optimizer (initially no params; will reset per domain) ──
-    optimizer = None
-    scheduler = None
-
     # ── tracking ──
+    optimizer = None
     results = {}
     domain_map = {}       # fdd_domain_id → list of domain_names
     total_correct = 0
     total_samples = 0
     current_fdd_domain = -1
+    global_step = 0       # global batch counter across all domains
 
     # ── un-normalized transform for FDD (need raw pixel images) ──
-    # FDD operates on raw images before normalisation
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
@@ -143,10 +167,9 @@ def adapt(cfg):
             B = images.shape[0]
 
             # ─── Step 1: FDD domain detection ───
-            # un-normalise for FDD
             mean = imagenet_mean.to(cfg.device)
             std = imagenet_std.to(cfg.device)
-            raw_images = images * std + mean             # [B, 3, H, W] ~[0,1]
+            raw_images = images * std + mean
 
             fdd_domain_id, is_new = fdd.detect_domain(raw_images)
 
@@ -155,24 +178,15 @@ def adapt(cfg):
                 expert_id = model.expand_domain()
                 model.set_active_domain(expert_id)
                 current_fdd_domain = fdd_domain_id
-
-                # record mapping
                 domain_map[fdd_domain_id] = [domain_name]
                 print(f"  [FDD] New domain {fdd_domain_id} detected "
                       f"→ expert {expert_id} created")
 
-                # reset optimizer for new parameters
-                params = model.get_trainable_params()
-                optimizer = Adam(params, lr=cfg.lr,
-                                betas=(0.9, 0.999),
-                                weight_decay=cfg.weight_decay)
-                # estimate total batches for this domain segment
-                est_batches = len(loader)
-                scheduler = CosineAnnealingLR(optimizer,
-                                              T_max=max(est_batches, 1))
+                # new optimizer for the new set of trainable params
+                current_lr = cosine_lr(cfg.lr, global_step, total_batches)
+                optimizer = make_optimizer(model, cfg, current_lr)
 
             elif fdd_domain_id != current_fdd_domain:
-                # known domain, switch expert
                 model.set_active_domain(fdd_domain_id)
                 current_fdd_domain = fdd_domain_id
 
@@ -184,18 +198,18 @@ def adapt(cfg):
                 print(f"  [FDD] Matched domain {fdd_domain_id} "
                       f"→ expert {fdd_domain_id} activated")
 
-                # update optimizer for potentially different trainable params
-                params = model.get_trainable_params()
-                optimizer = Adam(params, lr=cfg.lr,
-                                betas=(0.9, 0.999),
-                                weight_decay=cfg.weight_decay)
-                est_batches = len(loader)
-                scheduler = CosineAnnealingLR(optimizer,
-                                              T_max=max(est_batches, 1))
+                # new optimizer for changed trainable params
+                current_lr = cosine_lr(cfg.lr, global_step, total_batches)
+                optimizer = make_optimizer(model, cfg, current_lr)
+
+            # ─── Update LR based on global step (cosine over full stream) ───
+            if optimizer is not None:
+                current_lr = cosine_lr(cfg.lr, global_step, total_batches)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
 
             # ─── Step 4: Forward pass ───
-            # expert modules need grad; backbone is frozen
-            logits = model(images)                       # [B, C]
+            logits = model(images)
 
             # ─── Step 5: Compute filtered entropy loss (Eq. 18) ───
             loss = filtered_entropy_loss(logits, cfg.entropy_threshold,
@@ -206,8 +220,6 @@ def adapt(cfg):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
 
                 # ─── Stochastic restore of shared expert (CoTTA-style) ───
                 if cfg.stochastic_restore > 0:
@@ -231,6 +243,8 @@ def adapt(cfg):
                 total_correct += correct
                 total_samples += B
 
+            global_step += 1
+
         # ── segment summary ──
         seg_acc = seg_correct / max(seg_total, 1) * 100
         seg_err = 100.0 - seg_acc
@@ -246,9 +260,12 @@ def adapt(cfg):
             "time": elapsed,
         }
 
+        lr_now = cosine_lr(cfg.lr, global_step, total_batches)
         print(f"  Error: {seg_err:.1f}% | Acc: {seg_acc:.1f}% | "
               f"Loss: {seg_loss_avg:.4f} | "
               f"FDD domains: {fdd.num_domains} | "
+              f"LR: {lr_now:.2e} | "
+              f"Step: {global_step}/{total_batches} | "
               f"Time: {elapsed:.1f}s")
 
     # ─── Final summary ────────────────────────────────────────────────
@@ -296,7 +313,6 @@ def _compute_rf(results, cfg):
     """
     from collections import defaultdict
 
-    # group by base domain (strip round suffix)
     domain_rounds = defaultdict(list)
     for name, r in results.items():
         base = name.rsplit("_R", 1)[0]
