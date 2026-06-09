@@ -3,8 +3,8 @@ main.py — Complete CTTA adaptation loop for the AAAI 2026 paper.
 
 Algorithm per batch:
   1. FDD detects domain (new or existing) from low-frequency descriptors
-  2. If new domain: expand expert pool, set as active
-  3. If known domain: set as active, freeze others
+  2. If new domain: expand expert pool, add params to optimizer
+  3. If known domain: set as active (optimizer already has its params)
   4. Forward pass through backbone + dual-branch experts
   5. Compute filtered entropy loss (Eq. 18)
   6. Update trainable parameters (shared + active domain expert)
@@ -37,15 +37,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
-# ─── Cosine LR helper (replaces CosineAnnealingLR) ───────────────────
-
-def cosine_lr(base_lr, step, total_steps):
-    """Compute LR at a given step using cosine annealing."""
-    if total_steps <= 0:
-        return base_lr
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
-
-
 # ─── Entropy loss with confidence filtering (Eq. 18) ──────────────────
 
 def filtered_entropy_loss(logits, threshold, entropy_floor=0.0):
@@ -74,18 +65,6 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0):
     # mean entropy over reliable samples
     loss = (entropy * mask).sum() / mask.sum()
     return loss
-
-
-# ─── Build optimizer for current trainable params ─────────────────────
-
-def make_optimizer(model, cfg, current_lr):
-    """Create Adam optimizer for currently trainable params at given LR."""
-    params = model.get_trainable_params()
-    if not params:
-        return None
-    return Adam(params, lr=current_lr,
-                betas=(0.9, 0.999),
-                weight_decay=cfg.weight_decay)
 
 
 # ─── Main adaptation loop ────────────────────────────────────────────
@@ -127,10 +106,7 @@ def adapt(cfg):
     # ── anti-collapse settings ──
     print(f"[Anti-collapse] entropy_floor={cfg.entropy_floor}, "
           f"stochastic_restore={cfg.stochastic_restore}")
-
-    # ── cosine schedule over entire stream ──
-    print(f"[Scheduler] Cosine annealing over {total_batches} total batches "
-          f"(LR: {cfg.lr} → 0)")
+    print(f"[Optimizer] Constant LR={cfg.lr}, weight_decay={cfg.weight_decay}")
 
     # ── save initial shared expert state (for stochastic restore) ──
     shared_init_state = {}
@@ -146,7 +122,7 @@ def adapt(cfg):
     total_correct = 0
     total_samples = 0
     current_fdd_domain = -1
-    global_step = 0       # global batch counter across all domains
+    global_step = 0
 
     # ── un-normalized transform for FDD (need raw pixel images) ──
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -182,11 +158,30 @@ def adapt(cfg):
                 print(f"  [FDD] New domain {fdd_domain_id} detected "
                       f"→ expert {expert_id} created")
 
-                # new optimizer for the new set of trainable params
-                current_lr = cosine_lr(cfg.lr, global_step, total_batches)
-                optimizer = make_optimizer(model, cfg, current_lr)
+                if optimizer is None:
+                    # first domain ever — create optimizer with all params
+                    optimizer = Adam(model.get_trainable_params(),
+                                    lr=cfg.lr, betas=(0.9, 0.999),
+                                    weight_decay=cfg.weight_decay)
+                else:
+                    # add new domain expert params to existing optimizer
+                    # (preserves momentum for shared expert + older domains)
+                    new_domain_params = []
+                    for em in model.expert_modules:
+                        if expert_id < len(em.domain_moes):
+                            new_domain_params.extend(
+                                em.domain_moes[expert_id].parameters())
+                    if new_domain_params:
+                        optimizer.add_param_group({
+                            'params': new_domain_params,
+                            'lr': cfg.lr,
+                            'betas': (0.9, 0.999),
+                            'weight_decay': cfg.weight_decay,
+                        })
 
             elif fdd_domain_id != current_fdd_domain:
+                # known domain — just switch active expert
+                # optimizer already has this domain's params from when it was created
                 model.set_active_domain(fdd_domain_id)
                 current_fdd_domain = fdd_domain_id
 
@@ -197,16 +192,6 @@ def adapt(cfg):
 
                 print(f"  [FDD] Matched domain {fdd_domain_id} "
                       f"→ expert {fdd_domain_id} activated")
-
-                # new optimizer for changed trainable params
-                current_lr = cosine_lr(cfg.lr, global_step, total_batches)
-                optimizer = make_optimizer(model, cfg, current_lr)
-
-            # ─── Update LR based on global step (cosine over full stream) ───
-            if optimizer is not None:
-                current_lr = cosine_lr(cfg.lr, global_step, total_batches)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = current_lr
 
             # ─── Step 4: Forward pass ───
             logits = model(images)
@@ -260,11 +245,10 @@ def adapt(cfg):
             "time": elapsed,
         }
 
-        lr_now = cosine_lr(cfg.lr, global_step, total_batches)
         print(f"  Error: {seg_err:.1f}% | Acc: {seg_acc:.1f}% | "
               f"Loss: {seg_loss_avg:.4f} | "
               f"FDD domains: {fdd.num_domains} | "
-              f"LR: {lr_now:.2e} | "
+              f"LR: {cfg.lr:.2e} | "
               f"Step: {global_step}/{total_batches} | "
               f"Time: {elapsed:.1f}s")
 
