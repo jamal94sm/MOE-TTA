@@ -8,7 +8,7 @@ Prints every 20 batches and tracks:
   - Constant LR with persistent optimizer (preserves Adam momentum)
 
 Usage:
-  python diagnose4.py --data_dir ./data/ImageNet-C --severity 5 --entropy_floor 0.05
+  python diagnose.py --data_dir ./data/ImageNet-C --severity 5 --entropy_floor 0.05
 """
 
 import torch
