@@ -68,12 +68,13 @@ class DualBranchExpert(nn.Module):
     """
 
     def __init__(self, dim, shared_rank=32, domain_rank=16,
-                 num_experts=2, fusion_lambda=0.5):
+             num_experts=2, fusion_lambda=0.5, use_shared=True):
         super().__init__()
         self.dim = dim
         self.domain_rank = domain_rank
         self.num_experts = num_experts
         self.fusion_lambda = fusion_lambda
+        self.use_shared = use_shared
 
         # shared expert branch (Eq. 3)
         self.shared_moe = MoEModule(dim, shared_rank, num_experts)
@@ -112,22 +113,18 @@ class DualBranchExpert(nn.Module):
                 p.requires_grad = requires_grad
 
     def forward(self, z):
-        """
-        z: [B, N, D] input token features
-        Returns: Z_out = z + λ * Y_shared + (1-λ) * Y_domain
-        """
-        lam = self.fusion_lambda
-
-        # shared branch (Eq. 3) — always active
-        y_shared = self.shared_moe(z)                   # [B, N, D]
-
-        # domain branch (Eq. 4)
+        if self.use_shared:
+            lam = self.fusion_lambda
+            y_shared = self.shared_moe(z)
+        else:
+            lam = 0.0
+            y_shared = torch.zeros_like(z)
+    
         if self.active_domain >= 0 and self.active_domain < len(self.domain_moes):
             y_domain = self.domain_moes[self.active_domain](z)
         else:
             y_domain = torch.zeros_like(z)
-
-        # fusion (Eq. 5)
+    
         z_out = z + lam * y_shared + (1.0 - lam) * y_domain
         return z_out
 
@@ -164,14 +161,12 @@ class DualBranchExpertManager:
         return self.blocks[0].num_domains if self.blocks else 0
 
     def trainable_parameters(self):
-        """Collect all trainable parameters (shared + active domain experts)."""
         params = []
         for block in self.blocks:
-            # shared expert is always trainable
-            for p in block.shared_moe.parameters():
-                if p.requires_grad:
-                    params.append(p)
-            # active domain expert
+            if block.use_shared:
+                for p in block.shared_moe.parameters():
+                    if p.requires_grad:
+                        params.append(p)
             if 0 <= block.active_domain < len(block.domain_moes):
                 for p in block.domain_moes[block.active_domain].parameters():
                     if p.requires_grad:
