@@ -89,15 +89,55 @@ def get_cfg(args=None):
                         "Maximizes entropy of batch-mean prediction to prevent "
                         "single-class collapse. 0 = disabled. Recommended: 1.0")
 
-    # opt in/out shared expert
-    p.add_argument("--use_shared_expert", action="store_true", default=True,
-               help="Use shared expert branch. If False, only domain experts are used.")
-    p.add_argument("--no_shared_expert", dest="use_shared_expert", action="store_false",
-               help="Disable shared expert branch.")
+    # ─── Cross-expert pseudo-label supervision ───
+    # Experts help each other learn via consensus pseudo-labels and
+    # knowledge distillation from backbone + previous experts.
+    #
+    # For domain k, the "teacher ensemble" consists of:
+    #   - Frozen backbone (always available)
+    #   - Expert 0 through k-1 (each with the shared expert at their time)
+    #
+    # Two supervision signals are generated:
+    #   1. Hard PL: cross-entropy on samples where all teachers agree
+    #   2. Soft KD: KL divergence from student to teacher ensemble distribution
+    #
+    # Total loss = ent_loss + pl_lambda * pl_loss + kd_lambda * kd_loss
+    #              + div_lambda * div_loss
+
+    p.add_argument("--use_pseudo_labels", action="store_true", default=False,
+                   help="Enable cross-expert pseudo-label supervision")
+    p.add_argument("--no_pseudo_labels", dest="use_pseudo_labels",
+                   action="store_false")
+
+    p.add_argument("--pl_lambda", type=float, default=0.5,
+                   help="Weight for hard pseudo-label cross-entropy loss. "
+                        "Higher = stronger supervision from agreed labels. "
+                        "Recommended: 0.3-1.0")
+
+    p.add_argument("--pl_threshold", type=float, default=0.9,
+                   help="Confidence threshold for pseudo-label acceptance. "
+                        "A voter's prediction counts only if max(softmax) > this. "
+                        "Higher = fewer but more reliable pseudo-labels. "
+                        "Recommended: 0.85-0.95")
+
+    p.add_argument("--pl_agreement", type=float, default=0.8,
+                   help="Fraction of voters that must agree on the same class. "
+                        "1.0 = unanimous agreement required. "
+                        "0.5 = simple majority. "
+                        "Recommended: 0.8 (80% of voters)")
+
+    p.add_argument("--kd_lambda", type=float, default=0.5,
+                   help="Weight for soft knowledge distillation loss. "
+                        "KL divergence from current expert to teacher ensemble. "
+                        "0 = disabled (hard PL only). "
+                        "Recommended: 0.3-1.0")
+
+    p.add_argument("--kd_temperature", type=float, default=2.0,
+                   help="Temperature for KD softmax. Higher = softer distributions, "
+                        "transfers more inter-class relationships. "
+                        "1.0 = standard softmax. Recommended: 1.5-3.0")
 
     # misc
-    p.add_argument("--eval_backbone", action="store_true", default=False,
-               help="Evaluate frozen backbone on each domain before adaptation")
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
     p.add_argument("--output_dir", default="./output")
