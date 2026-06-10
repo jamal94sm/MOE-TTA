@@ -60,7 +60,8 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0, div_lambda=0.0):
 
     if div_lambda > 0:
         batch_mean_prob = probs.mean(dim=0)              # [C]
-        div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum()
+        log_C = math.log(probs.shape[-1])
+        div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum() + log_C
         return ent_loss + div_lambda * div_loss
 
     return ent_loss
