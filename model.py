@@ -53,6 +53,7 @@ class ExpertViT(nn.Module):
                 domain_rank=cfg.domain_rank,
                 num_experts=cfg.num_experts_per_moe,
                 fusion_lambda=cfg.fusion_lambda,
+                use_shared=cfg.use_shared_expert,
             )
             # register the hook or store the expert
             self.expert_manager.register(expert)
