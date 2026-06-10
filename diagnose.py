@@ -20,7 +20,7 @@ from config import get_cfg
 from datasets import get_domain_sequence
 from model import build_model
 from fdd import FrequencyDomainDiscriminator
-
+import math
 
 def main():
     cfg = get_cfg()
