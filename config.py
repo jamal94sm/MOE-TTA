@@ -89,6 +89,12 @@ def get_cfg(args=None):
                         "Maximizes entropy of batch-mean prediction to prevent "
                         "single-class collapse. 0 = disabled. Recommended: 1.0")
 
+    # opt in/out shared expert
+    p.add_argument("--use_shared_expert", action="store_true", default=True,
+               help="Use shared expert branch. If False, only domain experts are used.")
+    p.add_argument("--no_shared_expert", dest="use_shared_expert", action="store_false",
+               help="Disable shared expert branch.")
+
     # misc
     p.add_argument("--eval_backbone", action="store_true", default=False,
                help="Evaluate frozen backbone on each domain before adaptation")
