@@ -200,8 +200,9 @@ def main():
                 # batch diversity regularizer (all samples)
                 if cfg.div_lambda > 0:
                     batch_mean_prob = probs.mean(dim=0)
+                    log_C = math.log(probs.shape[-1])
                     div_loss = (batch_mean_prob * torch.log(
-                        batch_mean_prob + 1e-8)).sum()
+                        batch_mean_prob + 1e-8)).sum() + log_C
                     loss = ent_loss + cfg.div_lambda * div_loss
                 else:
                     loss = ent_loss
