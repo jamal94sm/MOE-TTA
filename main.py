@@ -295,7 +295,7 @@ def adapt(cfg):
             seg_loss_sum += loss.item() * B
 
             # ─── Step 6: Backward + update ───
-            if optimizer is not None and loss.item() > 0:
+            if optimizer is not None and loss.item() != 0:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
