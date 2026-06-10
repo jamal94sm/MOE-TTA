@@ -137,6 +137,11 @@ def get_cfg(args=None):
                         "transfers more inter-class relationships. "
                         "1.0 = standard softmax. Recommended: 1.5-3.0")
 
+    # opt in/out the shared expert
+    p.add_argument("--use_shared_expert", action="store_true", default=True,
+               help="Use shared expert branch. If False, only domain experts.")
+    p.add_argument("--no_shared_expert", dest="use_shared_expert", action="store_false")
+    
     # misc
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
