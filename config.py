@@ -76,7 +76,7 @@ def get_cfg(args=None):
                    help="κ coefficient: threshold = κ × ln(C)")
 
     # anti-collapse fixes
-    p.add_argument("--entropy_floor", type=float, default=0.05,
+    p.add_argument("--entropy_floor", type=float, default=0.0,
                    help="Skip update when entropy < this value "
                         "(prevents reinforcing overconfident predictions). "
                         "0 = disabled. Recommended: 0.05")
