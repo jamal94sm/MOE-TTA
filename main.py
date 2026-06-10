@@ -7,8 +7,9 @@ Algorithm per batch:
   3. If known domain: set as active (optimizer already has its params)
   4. Forward pass through backbone + dual-branch experts
   5. Compute filtered entropy loss (Eq. 18)
-  6. Update trainable parameters (shared + active domain expert)
-  7. Output predictions
+  6. Compute cross-expert PL + KD losses (if enabled)
+  7. Update trainable parameters (shared + active domain expert)
+  8. Output predictions
 """
 
 import os
@@ -27,6 +28,7 @@ from config import get_cfg
 from model import build_model
 from fdd import FrequencyDomainDiscriminator
 from datasets import get_domain_sequence
+from pseudo_labels import get_teacher_signals, compute_pl_kd_loss
 
 
 def set_seed(seed):
@@ -42,34 +44,20 @@ def set_seed(seed):
 def filtered_entropy_loss(logits, threshold, entropy_floor=0.0, div_lambda=0.0):
     """
     L = L_ent + λ_div × L_div
-
-    L_ent: filtered per-sample entropy minimization (Eq. 18)
-    L_div: batch diversity — negative entropy of mean prediction (IM loss)
-
-    logits:        [B, C] raw logits
-    threshold:     κ = 0.4 × ln(C)  (ceiling: skip uncertain samples)
-    entropy_floor: skip overconfident samples (prevents collapse reinforcement)
-    div_lambda:    weight for diversity term (0 = disabled)
-    Returns: scalar loss, or 0 if no samples pass the filter
     """
     probs = F.softmax(logits, dim=-1)
     log_probs = F.log_softmax(logits, dim=-1)
+    entropy = -(probs * log_probs).sum(dim=-1)
 
-    # per-sample entropy
-    entropy = -(probs * log_probs).sum(dim=-1)           # [B]
-
-    # filter: keep samples in the safe band [floor, κ)
-    mask = (entropy < threshold).float()                 # [B]
+    mask = (entropy < threshold).float()
     if entropy_floor > 0:
         mask = mask * (entropy > entropy_floor).float()
 
     if mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
 
-    # per-sample entropy minimization (filtered)
     ent_loss = (entropy * mask).sum() / mask.sum()
 
-    # batch diversity: maximize entropy of mean prediction (all samples)
     if div_lambda > 0:
         batch_mean_prob = probs.mean(dim=0)              # [C]
         div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum()
@@ -114,11 +102,19 @@ def adapt(cfg):
     print(f"[Data] {len(domain_sequence)} domain segments, "
           f"{total_batches} total batches")
 
-    # ── anti-collapse settings ──
+    # ── settings ──
     print(f"[Anti-collapse] entropy_floor={cfg.entropy_floor}, "
           f"stochastic_restore={cfg.stochastic_restore}, "
           f"div_lambda={cfg.div_lambda}")
     print(f"[Optimizer] Constant LR={cfg.lr}, weight_decay={cfg.weight_decay}")
+    if cfg.use_pseudo_labels:
+        print(f"[PL/KD] ENABLED: pl_lambda={cfg.pl_lambda}, "
+              f"kd_lambda={cfg.kd_lambda}, "
+              f"pl_threshold={cfg.pl_threshold}, "
+              f"pl_agreement={cfg.pl_agreement}, "
+              f"kd_temperature={cfg.kd_temperature}")
+    else:
+        print(f"[PL/KD] Disabled")
 
     # ── evaluate frozen backbone (source baseline) ──
     eval_bb = getattr(cfg, 'eval_backbone', False)
@@ -152,13 +148,13 @@ def adapt(cfg):
     # ── tracking ──
     optimizer = None
     results = {}
-    domain_map = {}       # fdd_domain_id → list of domain_names
+    domain_map = {}
     total_correct = 0
     total_samples = 0
     current_fdd_domain = -1
     global_step = 0
 
-    # ── un-normalized transform for FDD (need raw pixel images) ──
+    # ── un-normalized transform for FDD ──
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
@@ -167,6 +163,8 @@ def adapt(cfg):
            f"{'H_p50':>5} │ {'H_p90':>5} │ {'filt%':>5} │ {'uniq':>4} │ "
            f"{'top_cls':>7} │ {'top%':>4} │ {'H_correct':>9} │ {'H_wrong':>7} │ "
            f"{'shrd_norm':>9} │ {'dom_norm':>8}")
+    if cfg.use_pseudo_labels:
+        hdr += (f" │ {'PL%':>4} │ {'PLloss':>6} │ {'KDloss':>6}")
 
     for seg_idx, (domain_name, loader) in enumerate(domain_sequence):
         seg_correct = 0
@@ -180,15 +178,16 @@ def adapt(cfg):
         top_class_history = []
         updates_applied = 0
         updates_skipped = 0
+        pl_total_agreed = 0
+        pl_total_samples = 0
+        pl_loss_sum = 0.0
+        kd_loss_sum = 0.0
 
         print(f"\n{'─'*90}")
         print(f"  [{seg_idx+1}/{len(domain_sequence)}] {domain_name} "
               f"({len(loader.dataset)} samples, {n_batches} batches)")
         print(f"{'─'*90}")
         print(hdr)
-        print(f"  {'─'*5}─┼─{'─'*5}─┼─{'─'*6}─┼─{'─'*5}─┼─{'─'*5}─┼─{'─'*5}─┼─"
-              f"{'─'*5}─┼─{'─'*4}─┼─{'─'*7}─┼─{'─'*4}─┼─{'─'*9}─┼─{'─'*7}─┼─"
-              f"{'─'*9}─┼─{'─'*8}")
 
         for batch_idx, (images, labels) in enumerate(loader):
             images = images.to(cfg.device)
@@ -231,12 +230,10 @@ def adapt(cfg):
             elif fdd_domain_id != current_fdd_domain:
                 model.set_active_domain(fdd_domain_id)
                 current_fdd_domain = fdd_domain_id
-
                 if fdd_domain_id in domain_map:
                     domain_map[fdd_domain_id].append(domain_name)
                 else:
                     domain_map[fdd_domain_id] = [domain_name]
-
                 print(f"  >>> FDD: Matched domain {fdd_domain_id} "
                       f"→ expert {fdd_domain_id} activated")
 
@@ -253,25 +250,21 @@ def adapt(cfg):
             seg_correct += correct
             seg_total += B
 
-            # entropy percentiles
             H_sorted = entropy.sort().values
             H_p10 = H_sorted[int(0.1 * B)].item()
             H_p50 = H_sorted[int(0.5 * B)].item()
             H_p90 = H_sorted[int(0.9 * B)].item()
 
-            # entropy of correct vs wrong
             correct_mask = (preds == labels)
             H_correct = entropy[correct_mask].mean().item() if correct_mask.any() else -1
             H_wrong = entropy[~correct_mask].mean().item() if (~correct_mask).any() else -1
 
-            # prediction diversity
             pred_counts = Counter(preds.cpu().tolist())
             top_pred, top_count = pred_counts.most_common(1)[0]
             top_pct = 100 * top_count / B
             unique_preds = len(pred_counts)
             top_class_history.append((top_pred, top_pct))
 
-            # expert param norms (block 0 as proxy)
             shared_norm = 0.0
             domain_norm = 0.0
             with torch.no_grad():
@@ -290,14 +283,45 @@ def adapt(cfg):
                 mask = mask & (entropy > cfg.entropy_floor)
             pass_rate = mask.float().mean().item() * 100
 
-            loss = filtered_entropy_loss(logits, cfg.entropy_threshold,
-                                         cfg.entropy_floor, cfg.div_lambda)
-            seg_loss_sum += loss.item() * B
+            ent_loss = filtered_entropy_loss(logits, cfg.entropy_threshold,
+                                              cfg.entropy_floor, cfg.div_lambda)
 
-            # ─── Step 6: Backward + update ───
-            if optimizer is not None and loss.item() != 0:
+            # ─── Step 6: Cross-expert PL + KD losses ───
+            batch_pl_loss = 0.0
+            batch_kd_loss = 0.0
+            batch_pl_rate = 0.0
+
+            if cfg.use_pseudo_labels:
+                pseudo_labels, pl_mask, teacher_probs, pl_stats = \
+                    get_teacher_signals(model, images, current_fdd_domain, cfg)
+
+                pl_loss, kd_loss, loss_stats = compute_pl_kd_loss(
+                    logits, pseudo_labels, pl_mask, teacher_probs, cfg)
+
+                batch_pl_loss = loss_stats["pl_loss"]
+                batch_kd_loss = loss_stats["kd_loss"]
+                batch_pl_rate = pl_stats["agreement_rate"]
+
+                pl_total_agreed += loss_stats["pl_samples"]
+                pl_total_samples += B
+                pl_loss_sum += batch_pl_loss * B
+                kd_loss_sum += batch_kd_loss * B
+
+                # combine: entropy + PL + KD
+                total_loss = ent_loss
+                if cfg.pl_lambda > 0 and pl_loss.item() > 0:
+                    total_loss = total_loss + cfg.pl_lambda * pl_loss
+                if cfg.kd_lambda > 0 and kd_loss.item() > 0:
+                    total_loss = total_loss + cfg.kd_lambda * kd_loss
+            else:
+                total_loss = ent_loss
+
+            seg_loss_sum += total_loss.item() * B
+
+            # ─── Step 7: Backward + update ───
+            if optimizer is not None and total_loss.item() != 0:
                 optimizer.zero_grad()
-                loss.backward()
+                total_loss.backward()
                 optimizer.step()
                 updates_applied += 1
 
@@ -315,15 +339,21 @@ def adapt(cfg):
             else:
                 updates_skipped += 1
 
-            # ─── Print signals every 50 batches, first 5, and last batch ───
+            # ─── Print signals ───
             if batch_idx < 5 or batch_idx % 50 == 0 or batch_idx == n_batches - 1:
                 h_c_str = f"{H_correct:.3f}" if H_correct >= 0 else "  N/A"
                 h_w_str = f"{H_wrong:.3f}" if H_wrong >= 0 else "  N/A"
-                print(f"  {batch_idx:5d} │ {err:5.1f} │ {entropy.mean().item():6.3f} │ "
-                      f"{H_p10:5.3f} │ {H_p50:5.3f} │ {H_p90:5.3f} │ "
-                      f"{pass_rate:5.1f} │ {unique_preds:4d} │ "
-                      f"cls{top_pred:>4d} │ {top_pct:4.0f} │ {h_c_str:>9s} │ "
-                      f"{h_w_str:>7s} │ {shared_norm:9.4f} │ {domain_norm:8.4f}")
+                line = (f"  {batch_idx:5d} │ {err:5.1f} │ "
+                        f"{entropy.mean().item():6.3f} │ "
+                        f"{H_p10:5.3f} │ {H_p50:5.3f} │ {H_p90:5.3f} │ "
+                        f"{pass_rate:5.1f} │ {unique_preds:4d} │ "
+                        f"cls{top_pred:>4d} │ {top_pct:4.0f} │ {h_c_str:>9s} │ "
+                        f"{h_w_str:>7s} │ {shared_norm:9.4f} │ "
+                        f"{domain_norm:8.4f}")
+                if cfg.use_pseudo_labels:
+                    line += (f" │ {batch_pl_rate:4.0f} │ "
+                             f"{batch_pl_loss:6.3f} │ {batch_kd_loss:6.3f}")
+                print(line)
 
             total_correct += correct
             total_samples += B
@@ -366,16 +396,26 @@ def adapt(cfg):
             arrow = "↓" if improvement > 0 else "↑"
             print(f"  │ Backbone Error:  {baseline_err:.1f}%")
             print(f"  │ TTA Error:       {avg_err:.1f}%  "
-                  f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, Δ={trend:+.1f}%)")
+                  f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, "
+                  f"Δ={trend:+.1f}%)")
             print(f"  │ Improvement:     {arrow} {abs(improvement):.1f}%"
                   f"{'  ⚠ TTA HURTS' if improvement < -1 else ''}")
         else:
             print(f"  │ Avg Error:       {avg_err:.1f}%  "
-                  f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, Δ={trend:+.1f}%)")
+                  f"(first25%={first_q:.1f}% → last25%={last_q:.1f}%, "
+                  f"Δ={trend:+.1f}%)")
         print(f"  │ Loss: {seg_loss_avg:.4f} | "
               f"FDD domains: {fdd.num_domains} | "
               f"Time: {elapsed:.1f}s")
         print(f"  │ Updates: {updates_applied} applied, {updates_skipped} skipped")
+        if cfg.use_pseudo_labels:
+            pl_avg_rate = 100.0 * pl_total_agreed / max(pl_total_samples, 1)
+            pl_avg_loss = pl_loss_sum / max(pl_total_samples, 1)
+            kd_avg_loss = kd_loss_sum / max(pl_total_samples, 1)
+            print(f"  │ PL/KD: {pl_avg_rate:.1f}% samples agreed | "
+                  f"PL_loss={pl_avg_loss:.4f} | KD_loss={kd_avg_loss:.4f} | "
+                  f"voters={current_fdd_domain + 1} "
+                  f"(backbone + {current_fdd_domain} prev experts)")
         print(f"  │ Step: {global_step}/{total_batches}")
         if takeover_batch is not None:
             cls, pct = top_class_history[takeover_batch]
@@ -397,7 +437,8 @@ def adapt(cfg):
     mean_error = np.mean([r["error"] for r in results.values()])
 
     if baseline_errors:
-        print(f"\n  {'Domain':<25} {'Backbone':>10} {'TTA':>10} {'Improv.':>10} {'FDD':>5}")
+        print(f"\n  {'Domain':<25} {'Backbone':>10} {'TTA':>10} "
+              f"{'Improv.':>10} {'FDD':>5}")
         print(f"  {'─'*25}─{'─'*10}─{'─'*10}─{'─'*10}─{'─'*5}")
 
         for name, r in results.items():
@@ -407,7 +448,8 @@ def adapt(cfg):
             arrow = "↓" if imp > 0 else "↑"
             marker = " ⚠" if imp < -1 else ""
             print(f"  {name:<25} {b_err:>9.1f}% {t_err:>9.1f}% "
-                  f"{arrow} {abs(imp):>7.1f}%{marker:>3s} {r['fdd_domain']:>5d}")
+                  f"{arrow} {abs(imp):>7.1f}%{marker:>3s} "
+                  f"{r['fdd_domain']:>5d}")
 
         backbone_mean = np.mean(list(baseline_errors.values()))
         mean_imp = backbone_mean - mean_error
@@ -417,16 +459,15 @@ def adapt(cfg):
     else:
         print(f"\n  {'Domain':<25} {'TTA Error':>12} {'FDD Domain':>12}")
         print(f"  {'─'*25}─{'─'*12}─{'─'*12}")
-
         for name, r in results.items():
-            print(f"  {name:<25} {r['error']:>11.1f}% {r['fdd_domain']:>12d}")
-
+            print(f"  {name:<25} {r['error']:>11.1f}% "
+                  f"{r['fdd_domain']:>12d}")
         print(f"  {'─'*25}─{'─'*12}─{'─'*12}")
         print(f"  {'MEAN':<25} {mean_error:>11.1f}%")
 
     print(f"\n  Total FDD domains discovered: {fdd.num_domains}")
 
-    # CRS-specific: compute Repeat Forget (RF) metric
+    # CRS-specific
     if cfg.dataset in ["imagenet_plus", "imagenet_plusplus"]:
         _compute_rf(results, cfg)
 
@@ -435,6 +476,16 @@ def adapt(cfg):
         "tta": {name: r for name, r in results.items()},
         "mean_tta_error": mean_error,
         "total_fdd_domains": fdd.num_domains,
+        "config": {
+            "use_pseudo_labels": cfg.use_pseudo_labels,
+            "pl_lambda": cfg.pl_lambda,
+            "kd_lambda": cfg.kd_lambda,
+            "pl_threshold": cfg.pl_threshold,
+            "pl_agreement": cfg.pl_agreement,
+            "kd_temperature": cfg.kd_temperature,
+            "div_lambda": cfg.div_lambda,
+            "entropy_floor": cfg.entropy_floor,
+        },
     }
     if baseline_errors:
         save_data["baseline"] = baseline_errors
@@ -448,7 +499,7 @@ def adapt(cfg):
         json.dump(save_data, f, indent=2)
     print(f"\n  Results saved to {out_path}")
 
-    # domain mapping summary
+    # domain mapping
     print(f"\n  FDD domain mapping:")
     for fdd_id, names in domain_map.items():
         unique_names = list(set(n.rsplit("_R", 1)[0] for n in names))
@@ -458,12 +509,7 @@ def adapt(cfg):
 
 
 def _compute_rf(results, cfg):
-    """
-    Compute Repeat Forget (RF) metric for CRS benchmarks.
-    RF = Error_final - Error_first (lower is better).
-    """
     from collections import defaultdict
-
     domain_rounds = defaultdict(list)
     for name, r in results.items():
         base = name.rsplit("_R", 1)[0]
@@ -479,13 +525,9 @@ def _compute_rf(results, cfg):
             print(f"    {base:20s}: R1={errors[0]:.1f}% → "
                   f"R{len(errors)}={errors[-1]:.1f}%  "
                   f"RF={rf:+.1f} ({trend})")
-
     if rf_values:
-        mean_rf = np.mean(rf_values)
-        print(f"    {'Mean RF':20s}: {mean_rf:+.1f}")
+        print(f"    {'Mean RF':20s}: {np.mean(rf_values):+.1f}")
 
-
-# ─── Entry point ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     cfg = get_cfg()
