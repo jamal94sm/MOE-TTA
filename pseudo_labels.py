@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from collections import Counter
 
-
+'''
 @torch.no_grad()
 def get_teacher_signals(model, images, active_domain, cfg):
     """
@@ -165,7 +165,45 @@ def get_teacher_signals(model, images, active_domain, cfg):
     }
 
     return pseudo_labels, pl_mask, teacher_probs, kd_mask, stats
+'''
 
+@torch.no_grad()
+def get_teacher_signals(model, images, active_domain, cfg):
+    """
+    Compute hard pseudo-labels and soft teacher distributions strictly from
+    the frozen backbone, bypassing expert pooling and consensus routing.
+    """
+    B = images.shape[0]
+    threshold = cfg.pl_threshold
+    T = cfg.kd_temperature
+
+    # 1. Direct forward pass through the frozen backbone only
+    bb_logits = model.backbone(images)
+    bb_probs = F.softmax(bb_logits, dim=-1)
+    bb_conf, bb_pred = bb_probs.max(dim=-1)
+
+    # 2. Assign pseudo-labels and quality mask directly from the backbone
+    pseudo_labels = bb_pred
+    pl_mask = bb_conf > threshold  # True only where backbone is confident
+
+    # 3. Compute temperature-scaled soft distributions for Knowledge Distillation
+    teacher_probs = F.softmax(bb_logits / T, dim=-1)
+    kd_mask = bb_conf > threshold
+
+    # 4. Maintain diagnostic stats interface for main.py logs
+    stats = {
+        "num_voters": 1,
+        "num_agreed": pl_mask.sum().item(),
+        "agreement_rate": pl_mask.float().mean().item() * 100,
+        "teacher_conf": bb_conf.mean().item(),
+        "experts_excluded": 0.0,
+        "kd_samples": kd_mask.sum().item(),
+        "bb_pred": bb_pred,
+        "teacher_pred": bb_pred,
+    }
+
+    return pseudo_labels, pl_mask, teacher_probs, kd_mask, stats
+    
 
 def compute_pl_kd_loss(logits, pseudo_labels, pl_mask, teacher_probs, kd_mask, cfg):
     """
