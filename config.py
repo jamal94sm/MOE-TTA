@@ -18,6 +18,22 @@ CRS_DOMAINS = ["imagenet_v2", "imagenet_a", "imagenet_r", "imagenet_sketch"]
 
 ACDC_DOMAINS = ["fog", "night", "rain", "snow"]
 
+# Oracle domain families for controlled cross-expert experiments.
+# One expert per group. Within-group experts should help each other,
+# across-group experts should not.
+ORACLE_DOMAINS = {
+    "noise":   ["gaussian_noise", "shot_noise", "impulse_noise"],
+    "blur":    ["defocus_blur", "glass_blur", "motion_blur", "zoom_blur"],
+    "weather": ["snow", "frost", "fog", "brightness"],
+    "digital": ["contrast", "elastic_transform", "pixelate", "jpeg_compression"],
+}
+
+# Reverse lookup: corruption_name → (group_name, group_id)
+ORACLE_LOOKUP = {}
+for gid, (gname, corruptions) in enumerate(ORACLE_DOMAINS.items()):
+    for c in corruptions:
+        ORACLE_LOOKUP[c] = (gname, gid)
+
 # ─── Class mappings for partial-class datasets ────────────────────────
 # ImageNet-A and ImageNet-R use 200 of the 1000 ImageNet classes.
 # These mappings are loaded at runtime from the dataset folders.
@@ -147,6 +163,24 @@ def get_cfg(args=None):
                         "diversity losses update the expert. This lets the expert "
                         "learn basic domain features before receiving cross-expert "
                         "supervision. 0 = no warmup. Recommended: 30-100")
+
+    # ─── Teacher selection for PL/KD ───
+    p.add_argument("--fdd_include_threshold", type=float, default=1.0,
+                   help="Include previous expert as teacher only if its FDD domain "
+                        "distance from the current batch < this threshold. "
+                        "Stricter than τ=1.5 (new-domain detection). "
+                        "0 = backbone-only teacher (no cross-expert). "
+                        "Recommended: 0.8-1.2")
+
+    # ─── Oracle domain detection ───
+    # Assigns corruptions to 4 known families instead of FDD.
+    # Useful for evaluating cross-expert interactions under
+    # perfect domain grouping.
+    p.add_argument("--oracle_domains", action="store_true", default=False,
+                   help="Use oracle domain grouping (4 families) instead of FDD. "
+                        "noise=[gauss,shot,impulse], blur=[defocus,glass,motion,zoom], "
+                        "weather=[snow,frost,fog,brightness], "
+                        "digital=[contrast,elastic,pixelate,jpeg]")
 
     # backbone evaluation
     p.add_argument("--eval_backbone", action="store_true", default=False,
