@@ -152,7 +152,7 @@ def get_cfg(args=None):
                         "0 = disabled (hard PL only). "
                         "Recommended: 0.3-1.0")
 
-    p.add_argument("--kd_temperature", type=float, default=2.0,
+    p.add_argument("--kd_temperature", type=float, default=1.0,
                    help="Temperature for KD softmax. Higher = softer distributions, "
                         "transfers more inter-class relationships. "
                         "1.0 = standard softmax. Recommended: 1.5-3.0")
