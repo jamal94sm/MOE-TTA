@@ -2,26 +2,16 @@
 pseudo_labels.py — Cross-expert pseudo-label supervision and
 knowledge distillation for continual test-time adaptation.
 
-Provides two supervision signals for domain expert k:
-
-  1. Hard pseudo-labels (PL): Cross-entropy loss on samples where
-     the teacher ensemble unanimously agrees with high confidence.
-     Teachers = frozen backbone + experts 0..k-1.
-
-  2. Soft knowledge distillation (KD): KL divergence from the current
-     expert's distribution to the teacher ensemble's soft distribution.
-     Teacher distribution = confidence-weighted mean of all voters.
-
-For domain 0 (first expert):
-  - Only the frozen backbone is available as teacher.
-  - PL: samples where backbone confidence > threshold.
-  - KD: distill from backbone's soft predictions.
-
-For domain k > 0:
-  - Teachers: backbone + expert_0 + expert_1 + ... + expert_{k-1}
-  - Each teacher runs through the full model (backbone + their expert).
-  - PL: samples where ≥ pl_agreement fraction of teachers agree.
-  - KD: confidence-weighted average of all teacher distributions.
+v3: Group consensus filtering — the majority group determines the
+    teacher for each sample. Any voter (including backbone) that
+    disagrees with the majority is excluded per-sample.
+    
+    Teacher ensemble for sample i:
+      1. All voters (backbone + experts 0..k-1) predict
+      2. Only confident voters (max(softmax) > threshold) participate
+      3. Find majority class among confident voters
+      4. Exclude voters that disagree with the majority
+      5. Teacher = confidence-weighted mean of remaining voters' soft predictions
 """
 
 import torch
@@ -32,177 +22,169 @@ from collections import Counter
 @torch.no_grad()
 def get_teacher_signals(model, images, active_domain, cfg):
     """
-    Compute hard pseudo-labels and soft teacher distribution for the
-    current domain's expert, using backbone + all previous experts.
+    Compute hard pseudo-labels and soft teacher distribution using
+    group consensus: the majority determines the teacher, not the backbone.
 
     Args:
-        model:          ExpertViT model (with set_active_domain)
+        model:          ExpertViT model
         images:         [B, C, H, W] input batch
         active_domain:  current domain index (int)
         cfg:            config with pl_threshold, pl_agreement, kd_temperature
 
     Returns:
-        pseudo_labels:  [B] int64 — agreed class per sample (valid where mask=True)
-        pl_mask:        [B] bool — True for samples with consensus agreement
-        teacher_probs:  [B, num_classes] float — soft teacher distribution for KD
-        stats:          dict with diagnostic info (num_voters, num_agreed, etc.)
+        pseudo_labels:  [B] hard labels from consensus
+        pl_mask:        [B] bool — samples with strong agreement
+        teacher_probs:  [B, C] soft teacher distribution (filtered)
+        kd_mask:        [B] bool — samples where teacher is confident for KD
+        stats:          dict with diagnostics
     """
     B = images.shape[0]
     device = images.device
     threshold = cfg.pl_threshold
     agreement_ratio = cfg.pl_agreement
+    T = cfg.kd_temperature
 
-    # ─── Collect predictions from all voters ──────────────────────────
+    # ─── Collect all voter predictions ────────────────────────────────
 
-    all_preds = []      # [num_voters, B] — hard predictions
-    all_confs = []      # [num_voters, B] — max confidence per sample
-    all_probs = []      # [num_voters, B, C] — full soft distributions
-    voter_names = []    # for diagnostics
+    all_logits = []     # [V][B, C]
+    all_preds = []      # [V][B]
+    all_confs = []      # [V][B]
+    voter_names = []
 
-    # Voter 0: frozen backbone (no experts)
+    # Voter 0: frozen backbone
     bb_logits = model.backbone(images)
     bb_probs = F.softmax(bb_logits, dim=-1)
     bb_conf, bb_pred = bb_probs.max(dim=-1)
 
+    all_logits.append(bb_logits)
     all_preds.append(bb_pred)
     all_confs.append(bb_conf)
-    all_probs.append(bb_probs)
     voter_names.append("backbone")
 
-    # Voters 1..k: previous domain experts (each with shared expert)
-    # We temporarily switch the active domain to get each expert's output
+    # Voters 1..k: previous domain experts
     for dom_id in range(active_domain):
         model.set_active_domain(dom_id)
         expert_logits = model(images)
         expert_probs = F.softmax(expert_logits, dim=-1)
         expert_conf, expert_pred = expert_probs.max(dim=-1)
 
+        all_logits.append(expert_logits)
         all_preds.append(expert_pred)
         all_confs.append(expert_conf)
-        all_probs.append(expert_probs)
         voter_names.append(f"expert_{dom_id}")
 
-    # Restore active domain
+    # restore active domain
     model.set_active_domain(active_domain)
 
     num_voters = len(all_preds)
-    preds_stack = torch.stack(all_preds, dim=0)   # [V, B]
-    confs_stack = torch.stack(all_confs, dim=0)    # [V, B]
-    probs_stack = torch.stack(all_probs, dim=0)    # [V, B, C]
+    preds_stack = torch.stack(all_preds, dim=0)    # [V, B]
+    confs_stack = torch.stack(all_confs, dim=0)     # [V, B]
+    logits_stack = torch.stack(all_logits, dim=0)   # [V, B, C]
 
-    # ─── Hard pseudo-labels: multi-model agreement (Criterion B) ──────
+    # temperature-scaled soft distributions
+    soft_stack = F.softmax(logits_stack / T, dim=-1)  # [V, B, C]
 
-    # For each sample, find the most common prediction among voters
-    # and check if enough voters agree AND are confident
+    # ─── Per-sample group consensus filtering ─────────────────────────
+    #
+    # For each sample:
+    #   1. Find confident voters (conf > threshold)
+    #   2. Among confident voters, find the majority class
+    #   3. Voters agreeing with majority = "in-group" (trusted)
+    #   4. Voters disagreeing = "excluded"
+    #   5. Teacher = confidence-weighted average of in-group soft predictions
+
     pseudo_labels = torch.zeros(B, dtype=torch.long, device=device)
     pl_mask = torch.zeros(B, dtype=torch.bool, device=device)
+    teacher_probs = torch.zeros(B, soft_stack.shape[-1], device=device)
+    teacher_conf_per_sample = torch.zeros(B, device=device)
     min_agree = max(1, int(num_voters * agreement_ratio))
 
-    for i in range(B):
-        sample_preds = preds_stack[:, i]            # [V]
-        sample_confs = confs_stack[:, i]            # [V]
+    total_excluded = 0  # track how many voter-sample pairs are excluded
 
-        # only count votes from confident voters
-        confident_mask = sample_confs > threshold   # [V]
-        if confident_mask.sum() < min_agree:
+    for i in range(B):
+        sample_preds = preds_stack[:, i]       # [V]
+        sample_confs = confs_stack[:, i]        # [V]
+        sample_soft = soft_stack[:, i, :]       # [V, C]
+
+        # step 1: filter confident voters
+        confident = sample_confs > threshold    # [V]
+        n_confident = confident.sum().item()
+
+        if n_confident == 0:
+            # no confident voter → use backbone as fallback
+            teacher_probs[i] = soft_stack[0, i, :]
+            teacher_conf_per_sample[i] = sample_confs[0]
             continue
 
-        confident_preds = sample_preds[confident_mask]
-
-        # find majority class among confident voters
-        pred_list = confident_preds.cpu().tolist()
-        counts = Counter(pred_list)
+        # step 2: find majority class among confident voters
+        confident_preds = sample_preds[confident].cpu().tolist()
+        counts = Counter(confident_preds)
         majority_class, majority_count = counts.most_common(1)[0]
 
-        # check if enough confident voters agree
-        if majority_count >= min_agree:
+        # step 3: in-group = confident AND agrees with majority
+        agrees_with_majority = (sample_preds == majority_class)  # [V]
+        in_group = confident & agrees_with_majority               # [V]
+        n_in_group = in_group.sum().item()
+        total_excluded += (confident.sum().item() - n_in_group)
+
+        # step 4: hard pseudo-label (if enough voters agree)
+        if n_in_group >= min_agree:
             pseudo_labels[i] = majority_class
             pl_mask[i] = True
 
-    # ─── Soft teacher distribution: confidence-weighted ensemble ──────
-    #
-    # Each voter's weight = mean confidence on this batch
-    # Higher confidence voter contributes more to the soft target
-    #
-    # teacher_probs[i] = Σ_v  w_v · softmax(logits_v[i] / T)
-    #                    ─────────────────────────────────────
-    #                              Σ_v w_v
+        # step 5: soft teacher from in-group voters
+        if n_in_group > 0:
+            w = sample_confs[in_group]              # [n_in_group]
+            w = w / w.sum()                         # normalize
+            in_group_soft = sample_soft[in_group]   # [n_in_group, C]
+            teacher_probs[i] = (w[:, None] * in_group_soft).sum(dim=0)
+            teacher_conf_per_sample[i] = sample_confs[in_group].mean()
+        else:
+            # fallback: backbone only
+            teacher_probs[i] = soft_stack[0, i, :]
+            teacher_conf_per_sample[i] = sample_confs[0]
 
-    T = cfg.kd_temperature
+    # ─── KD mask: only distill where filtered teacher is confident ────
+    kd_mask = teacher_conf_per_sample > threshold
 
-    # compute temperature-scaled distributions
-    # We need to recompute with temperature since probs_stack used T=1
-    if T != 1.0:
-        # re-collect with temperature (backbone)
-        soft_probs_list = [F.softmax(bb_logits / T, dim=-1)]
+    # ─── Teacher ensemble prediction (for accuracy diagnostics) ───────
+    teacher_pred = teacher_probs.argmax(dim=-1)
 
-        # re-collect previous experts with temperature
-        for dom_id in range(active_domain):
-            model.set_active_domain(dom_id)
-            expert_logits_t = model(images)
-            soft_probs_list.append(F.softmax(expert_logits_t / T, dim=-1))
-        model.set_active_domain(active_domain)
+    # ─── Stats ────────────────────────────────────────────────────────
+    avg_excluded = total_excluded / B if num_voters > 1 else 0
 
-        soft_probs_stack = torch.stack(soft_probs_list, dim=0)  # [V, B, C]
-    else:
-        soft_probs_stack = probs_stack
-
-    # per-voter confidence weight = mean max confidence across batch
-    voter_weights = confs_stack.mean(dim=1)         # [V]
-    voter_weights = voter_weights / voter_weights.sum()  # normalize
-
-    # weighted average of soft distributions
-    # [V, 1, 1] × [V, B, C] → sum over V → [B, C]
-    teacher_probs = (voter_weights[:, None, None] * soft_probs_stack).sum(dim=0)
-
-    # ─── Diagnostics ──────────────────────────────────────────────────
     stats = {
         "num_voters": num_voters,
-        "voter_names": voter_names,
         "num_agreed": pl_mask.sum().item(),
         "agreement_rate": pl_mask.float().mean().item() * 100,
-        "voter_weights": {name: w.item()
-                          for name, w in zip(voter_names, voter_weights)},
+        "teacher_conf": teacher_conf_per_sample.mean().item(),
+        "experts_excluded": avg_excluded,
+        "kd_samples": kd_mask.sum().item(),
+        "bb_pred": bb_pred,
+        "teacher_pred": teacher_pred,
     }
 
-    return pseudo_labels, pl_mask, teacher_probs, stats
+    return pseudo_labels, pl_mask, teacher_probs, kd_mask, stats
 
 
-def compute_pl_kd_loss(logits, pseudo_labels, pl_mask, teacher_probs, cfg):
+def compute_pl_kd_loss(logits, pseudo_labels, pl_mask, teacher_probs, kd_mask, cfg):
     """
-    Compute pseudo-label cross-entropy + knowledge distillation losses.
-
-    Args:
-        logits:         [B, C] current expert's raw logits
-        pseudo_labels:  [B] hard pseudo-labels from consensus
-        pl_mask:        [B] bool — which samples have valid pseudo-labels
-        teacher_probs:  [B, C] soft teacher distribution
-        cfg:            config with pl_lambda, kd_lambda, kd_temperature
-
-    Returns:
-        pl_loss:    scalar — cross-entropy on agreed samples (0 if none)
-        kd_loss:    scalar — KL divergence from student to teacher
-        stats:      dict with loss values for logging
+    Compute PL cross-entropy + filtered KD loss.
+    Both are applied only on their respective masked samples.
     """
     T = cfg.kd_temperature
 
-    # ─── Hard pseudo-label loss (cross-entropy on agreed samples) ─────
+    # ─── Hard PL loss (only on agreed samples) ────────────────────────
     if cfg.pl_lambda > 0 and pl_mask.sum() > 0:
         pl_loss = F.cross_entropy(logits[pl_mask], pseudo_labels[pl_mask])
     else:
         pl_loss = torch.tensor(0.0, device=logits.device)
 
-    # ─── Soft knowledge distillation loss (KL divergence) ─────────────
-    #
-    # Standard KD formulation (Hinton et al., 2015):
-    #   L_KD = T² × KL(softmax(teacher/T) || softmax(student/T))
-    #
-    # The T² scaling ensures gradient magnitudes are independent of T.
-
-    if cfg.kd_lambda > 0:
-        student_log_probs = F.log_softmax(logits / T, dim=-1)
-        # teacher_probs is already temperature-scaled from get_teacher_signals
-        kd_loss = F.kl_div(student_log_probs, teacher_probs,
+    # ─── Filtered KD loss (only on teacher-confident samples) ─────────
+    if cfg.kd_lambda > 0 and kd_mask.sum() > 0:
+        student_log_probs = F.log_softmax(logits[kd_mask] / T, dim=-1)
+        teacher_target = teacher_probs[kd_mask]
+        kd_loss = F.kl_div(student_log_probs, teacher_target,
                            reduction='batchmean') * (T * T)
     else:
         kd_loss = torch.tensor(0.0, device=logits.device)
@@ -211,6 +193,7 @@ def compute_pl_kd_loss(logits, pseudo_labels, pl_mask, teacher_probs, cfg):
         "pl_loss": pl_loss.item(),
         "kd_loss": kd_loss.item(),
         "pl_samples": pl_mask.sum().item(),
+        "kd_samples": kd_mask.sum().item(),
     }
 
     return pl_loss, kd_loss, stats
