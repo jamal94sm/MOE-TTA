@@ -37,11 +37,12 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0, div_lambda=0.0):
     if mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
     ent_loss = (entropy * mask).sum() / mask.sum()
+    ##########################################################################
     if div_lambda > 0:
-        batch_mean_prob = probs.mean(dim=0)
-        log_C = math.log(probs.shape[-1])
-        div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum() + log_C
+        batch_mean_prob = probs.mean(dim=0)              # [C]
+        div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum()
         return ent_loss + div_lambda * div_loss
+
     return ent_loss
 
 
