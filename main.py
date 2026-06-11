@@ -1,10 +1,10 @@
 """
 main.py — Complete CTTA adaptation loop for the AAAI 2026 paper.
 
-v4: Group consensus teacher + warmup phase for new experts.
-    - Teacher = majority-group consensus (not backbone-as-reference)
-    - New experts warm up with entropy+diversity only before PL/KD kicks in
-    - KD filtered to teacher-confident samples only
+v5: FDD distance-based teacher gating + oracle domain mode.
+    - FDD distances determine which experts teach which domains
+    - Oracle mode assigns corruptions to 4 known families
+    - Warmup phase, group consensus, filtered KD
 """
 
 import os, sys, math, time, json, random
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.optim import Adam
 from collections import Counter
 
-from config import get_cfg
+from config import get_cfg, ORACLE_LOOKUP
 from model import build_model
 from fdd import FrequencyDomainDiscriminator
 from datasets import get_domain_sequence
@@ -37,18 +37,22 @@ def filtered_entropy_loss(logits, threshold, entropy_floor=0.0, div_lambda=0.0):
     if mask.sum() == 0:
         return torch.tensor(0.0, device=logits.device)
     ent_loss = (entropy * mask).sum() / mask.sum()
-    ##########################################################################
     if div_lambda > 0:
-        batch_mean_prob = probs.mean(dim=0)              # [C]
+        batch_mean_prob = probs.mean(dim=0)
         log_C = math.log(probs.shape[-1])
         div_loss = (batch_mean_prob * torch.log(batch_mean_prob + 1e-8)).sum() + log_C
         return ent_loss + div_lambda * div_loss
+    return ent_loss
 
 
 def adapt(cfg):
     print(f"\n{'='*90}")
     print(f"  AAAI 2026: Shared & Domain Self-Adaptive Experts with FDD")
     print(f"  Dataset: {cfg.dataset} | LR: {cfg.lr} | BS: {cfg.batch_size}")
+    if cfg.oracle_domains:
+        print(f"  Domain detection: ORACLE (4 families: noise, blur, weather, digital)")
+    else:
+        print(f"  Domain detection: FDD (online, τ={cfg.fdd_threshold})")
     print(f"{'='*90}\n")
 
     model = build_model(cfg)
@@ -73,13 +77,13 @@ def adapt(cfg):
         print(f"[PL/KD] ENABLED: pl_lambda={cfg.pl_lambda}, kd_lambda={cfg.kd_lambda}, "
               f"pl_threshold={cfg.pl_threshold}, pl_agreement={cfg.pl_agreement}, "
               f"kd_temperature={cfg.kd_temperature}, pl_warmup={cfg.pl_warmup}")
+        print(f"[PL/KD] Teacher gating: fdd_include_threshold={cfg.fdd_include_threshold}")
     else:
         print(f"[PL/KD] Disabled")
 
     # ── backbone baseline ──
-    eval_bb = getattr(cfg, 'eval_backbone', False)
     baseline_errors = {}
-    if eval_bb:
+    if cfg.eval_backbone:
         print(f"\n[Baseline] Evaluating frozen backbone...")
         model.eval()
         with torch.no_grad():
@@ -104,7 +108,8 @@ def adapt(cfg):
     results = {}; domain_map = {}
     total_correct = total_samples = 0
     current_fdd_domain = -1; global_step = 0
-    batches_since_new_domain = 0  # warmup counter
+    batches_since_new_domain = 0
+    known_oracle_domains = set()  # track which oracle groups have been seen
 
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -135,19 +140,44 @@ def adapt(cfg):
         for batch_idx, (images, labels) in enumerate(loader):
             images = images.to(cfg.device); labels = labels.to(cfg.device)
             B = images.shape[0]
-
-            # ─── FDD ───
             mean = imagenet_mean.to(cfg.device); std = imagenet_std.to(cfg.device)
             raw_images = images * std + mean
-            fdd_domain_id, is_new = fdd.detect_domain(raw_images)
 
-            if is_new:
+            # ─── Domain detection: Oracle or FDD ───
+            if cfg.oracle_domains:
+                # Oracle: lookup corruption → group
+                corruption_base = domain_name.rsplit("_R", 1)[0]
+                if corruption_base in ORACLE_LOOKUP:
+                    group_name, group_id = ORACLE_LOOKUP[corruption_base]
+                else:
+                    group_name, group_id = "unknown", 0
+
+                is_new = (group_id not in known_oracle_domains)
+                fdd_domain_id = group_id
+
+                if is_new:
+                    known_oracle_domains.add(group_id)
+
+                # still run FDD for distance computation (teacher gating)
+                if batch_idx == 0:
+                    fdd_distances = fdd.distances_to_all_domains(raw_images)
+                    # also feed FDD so it builds domain stats for distance queries
+                    fdd.detect_domain(raw_images)
+            else:
+                # FDD: online detection
+                fdd_domain_id, is_new = fdd.detect_domain(raw_images)
+                # get distances for teacher gating (computed from same batch)
+                fdd_distances = fdd.distances_to_all_domains(raw_images)
+
+            # ─── Expand or activate expert ───
+            if is_new and batch_idx == 0:
                 expert_id = model.expand_domain()
                 model.set_active_domain(expert_id)
                 current_fdd_domain = fdd_domain_id
                 domain_map[fdd_domain_id] = [domain_name]
-                batches_since_new_domain = 0  # reset warmup counter
-                print(f"  >>> FDD: New domain {fdd_domain_id} → expert {expert_id} "
+                batches_since_new_domain = 0
+                label = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
+                print(f"  >>> New domain {fdd_domain_id} ({label}) → expert {expert_id} "
                       f"(warmup for {cfg.pl_warmup} batches)")
                 if optimizer is None:
                     optimizer = Adam(model.get_trainable_params(),
@@ -163,14 +193,16 @@ def adapt(cfg):
                             'params': new_params, 'lr': cfg.lr,
                             'betas': (0.9, 0.999), 'weight_decay': cfg.weight_decay})
 
-            elif fdd_domain_id != current_fdd_domain:
+            elif fdd_domain_id != current_fdd_domain and batch_idx == 0:
                 model.set_active_domain(fdd_domain_id)
                 current_fdd_domain = fdd_domain_id
                 if fdd_domain_id in domain_map:
                     domain_map[fdd_domain_id].append(domain_name)
                 else:
                     domain_map[fdd_domain_id] = [domain_name]
-                print(f"  >>> FDD: Matched domain {fdd_domain_id} → expert {fdd_domain_id}")
+                label = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
+                print(f"  >>> Matched domain {fdd_domain_id} ({label}) → "
+                      f"expert {fdd_domain_id}")
 
             # ─── Forward ───
             logits = model(images)
@@ -205,15 +237,14 @@ def adapt(cfg):
             batch_pl_rate = batch_pl_acc = batch_teacher_err = 0.0
             batch_kd_rate = batch_excl = 0.0
 
-            # determine if we're in warmup phase
             in_warmup = (cfg.use_pseudo_labels and
                          batches_since_new_domain < cfg.pl_warmup)
-            phase = "warmup" if in_warmup else "pl+kd"
+            phase = "warm" if in_warmup else "pl+kd"
 
             if cfg.use_pseudo_labels and not in_warmup:
-                # ─── PL/KD active ───
                 pseudo_labels_t, pl_mask, teacher_probs, kd_mask, pl_stats = \
-                    get_teacher_signals(model, images, current_fdd_domain, cfg)
+                    get_teacher_signals(model, images, current_fdd_domain, cfg,
+                                        fdd_distances=fdd_distances)
 
                 pl_loss, kd_loss, loss_stats = compute_pl_kd_loss(
                     logits, pseudo_labels_t, pl_mask, teacher_probs, kd_mask, cfg)
@@ -224,14 +255,12 @@ def adapt(cfg):
                 batch_kd_rate = 100.0 * loss_stats["kd_samples"] / B
                 batch_excl = pl_stats.get("experts_excluded", 0)
 
-                # PL accuracy diagnostic (uses GT labels)
                 if pl_mask.sum() > 0:
                     batch_pl_acc = (pseudo_labels_t[pl_mask] == labels[pl_mask]).float().mean().item() * 100
                     pl_correct_sum += (pseudo_labels_t[pl_mask] == labels[pl_mask]).sum().item()
                 else:
                     batch_pl_acc = -1
 
-                # teacher error diagnostic
                 teacher_pred = pl_stats["teacher_pred"]
                 t_correct = (teacher_pred == labels).sum().item()
                 batch_teacher_err = 100.0 * (1 - t_correct / B)
@@ -242,14 +271,12 @@ def adapt(cfg):
                 pl_loss_sum += batch_pl_loss * B
                 kd_loss_sum += batch_kd_loss * B
 
-                # combine
                 total_loss = ent_loss
                 if cfg.pl_lambda > 0 and pl_loss.item() > 0:
                     total_loss = total_loss + cfg.pl_lambda * pl_loss
                 if cfg.kd_lambda > 0 and kd_loss.item() > 0:
                     total_loss = total_loss + cfg.kd_lambda * kd_loss
             else:
-                # warmup or PL disabled: entropy + diversity only
                 total_loss = ent_loss
                 if in_warmup:
                     warmup_batches_used += 1
@@ -257,7 +284,7 @@ def adapt(cfg):
             seg_loss_sum += total_loss.item() * B
 
             # ─── Update ───
-            if optimizer is not None and total_loss.item() != 0:
+            if optimizer is not None and total_loss.item() > 0:
                 optimizer.zero_grad()
                 total_loss.backward()
                 optimizer.step()
@@ -282,14 +309,14 @@ def adapt(cfg):
                 line = (f"  {batch_idx:5d} │{err:5.1f} │{entropy.mean().item():6.3f} │"
                         f"{pass_rate:5.1f} │{top_pct:4.0f} │{hc:>5s} │{hw:>5s}")
                 if cfg.use_pseudo_labels:
-                    pla = f"{batch_pl_acc:.0f}" if batch_pl_acc > 0 else " --"
                     if in_warmup:
-                        line += (f" │  -- │  -- │  -- │  -- │  -- │   -- │   -- │"
-                                 f" {'warm':>6s}")
+                        line += (f" │  -- │  -- │  -- │  -- │  -- │"
+                                 f"   -- │   -- │ {'warm':>5s}")
                     else:
+                        pla = f"{batch_pl_acc:.0f}" if batch_pl_acc > 0 else " --"
                         line += (f" │{batch_pl_rate:4.0f} │{pla:>4s} │"
                                  f"{batch_teacher_err:4.0f} │{batch_kd_rate:4.0f} │"
-                                 f"{batch_excl:4.1f} │{batch_pl_loss:6.3f} │"
+                                 f"{batch_excl:4.0f} │{batch_pl_loss:6.3f} │"
                                  f"{batch_kd_loss:6.3f} │ {'pl+kd':>5s}")
                 print(line)
 
@@ -317,6 +344,10 @@ def adapt(cfg):
 
         baseline_err = baseline_errors.get(domain_name, None)
         print(f"\n  ┌── SUMMARY: {domain_name}")
+        if cfg.oracle_domains:
+            corruption_base = domain_name.rsplit("_R", 1)[0]
+            gn = ORACLE_LOOKUP.get(corruption_base, ("?", -1))[0]
+            print(f"  │ Oracle group: {gn} (domain {current_fdd_domain})")
         if baseline_err is not None:
             imp = baseline_err - avg_err
             print(f"  │ Backbone Error:  {baseline_err:.1f}%")
@@ -331,16 +362,13 @@ def adapt(cfg):
               f"Updates: {updates_applied}/{updates_applied + updates_skipped} | "
               f"Time: {elapsed:.1f}s")
         if cfg.use_pseudo_labels:
-            if pl_total_agreed > 0:
-                pl_acc_avg = 100.0 * pl_correct_sum / pl_total_agreed
-            else:
-                pl_acc_avg = 0.0
+            pl_acc_avg = 100.0 * pl_correct_sum / max(pl_total_agreed, 1) if pl_total_agreed > 0 else 0.0
             teacher_err_avg = 100.0 * (1 - teacher_correct_sum / max(teacher_total, 1)) if teacher_total > 0 else 0.0
             pl_avg_rate = 100.0 * pl_total_agreed / max(pl_total_samples, 1) if pl_total_samples > 0 else 0.0
-            print(f"  │ Warmup: {warmup_batches_used} batches (ent+div only), "
-                  f"then PL/KD for {n_batches - warmup_batches_used} batches")
+            print(f"  │ Warmup: {warmup_batches_used} batches, "
+                  f"then PL/KD for {n_batches - warmup_batches_used}")
             print(f"  │ PL: {pl_avg_rate:.1f}% agreed, "
-                  f"{pl_acc_avg:.1f}% of PLs correct | "
+                  f"{pl_acc_avg:.1f}% correct | "
                   f"Teacher err: {teacher_err_avg:.1f}% | "
                   f"voters={current_fdd_domain + 1}")
             print(f"  │ PL_loss={pl_loss_sum / max(pl_total_samples, 1):.4f} | "
@@ -386,7 +414,8 @@ def adapt(cfg):
         _compute_rf(results, cfg)
 
     save_data = {"tta": dict(results), "mean_tta_error": mean_error,
-                 "fdd_domains": fdd.num_domains}
+                 "fdd_domains": fdd.num_domains,
+                 "mode": "oracle" if cfg.oracle_domains else "fdd"}
     if baseline_errors:
         save_data["baseline"] = baseline_errors
         save_data["mean_backbone_error"] = bm; save_data["mean_improvement"] = mi
