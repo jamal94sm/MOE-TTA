@@ -209,3 +209,17 @@ class FrequencyDomainDiscriminator:
                  d["sigma"].mean().item() if self.diagonal
                  else d["sigma"].diag().mean().item())
                 for i, d in enumerate(self.domains)]
+
+    # ─── Distance to all domains (for teacher selection) ──────────────
+    @torch.no_grad()
+    def distances_to_all_domains(self, images):
+        """
+        Compute Mahalanobis distance from batch to every known domain.
+        Returns dict {domain_id: distance}.
+        Used by pseudo_labels.py to decide which experts to include as teachers.
+        """
+        if self.num_domains == 0:
+            return {}
+        descs = self.extract_descriptor(images)
+        z_mean = descs.mean(dim=0)
+        return {i: self._mahalanobis(z_mean, i) for i in range(self.num_domains)}
