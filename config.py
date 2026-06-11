@@ -124,7 +124,7 @@ def get_cfg(args=None):
                    help="Fraction of voters that must agree on the same class. "
                         "1.0 = unanimous agreement required. "
                         "0.5 = simple majority. "
-                        "Recommended: 0.8 (80% of voters)")
+                        "Recommended: 0.8 (80%% of voters)")
 
     p.add_argument("--kd_lambda", type=float, default=0.5,
                    help="Weight for soft knowledge distillation loss. "
@@ -137,11 +137,13 @@ def get_cfg(args=None):
                         "transfers more inter-class relationships. "
                         "1.0 = standard softmax. Recommended: 1.5-3.0")
 
-    # opt in/out the shared expert
-    p.add_argument("--use_shared_expert", action="store_true", default=True,
-               help="Use shared expert branch. If False, only domain experts.")
-    p.add_argument("--no_shared_expert", dest="use_shared_expert", action="store_false")
-    
+    p.add_argument("--pl_warmup", type=int, default=100,
+                   help="Number of batches after a new domain is detected before "
+                        "PL/KD losses are applied. During warmup, only entropy + "
+                        "diversity losses update the expert. This lets the expert "
+                        "learn basic domain features before receiving cross-expert "
+                        "supervision. 0 = no warmup. Recommended: 30-100")
+
     # misc
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
