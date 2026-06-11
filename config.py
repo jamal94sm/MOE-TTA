@@ -55,6 +55,10 @@ def get_cfg(args=None):
                    help="M: number of experts inside each MoE module")
     p.add_argument("--fusion_lambda", type=float, default=0.5,
                    help="λ: balance shared vs domain branch (Eq.5)")
+    p.add_argument("--use_shared_expert", action="store_true", default=True,
+                   help="Use shared expert branch. If False, only domain experts.")
+    p.add_argument("--no_shared_expert", dest="use_shared_expert",
+                   action="store_false")
 
     # FDD (Section 3.3)
     p.add_argument("--fdd_freq_radius", type=int, default=16,
@@ -143,6 +147,10 @@ def get_cfg(args=None):
                         "diversity losses update the expert. This lets the expert "
                         "learn basic domain features before receiving cross-expert "
                         "supervision. 0 = no warmup. Recommended: 30-100")
+
+    # backbone evaluation
+    p.add_argument("--eval_backbone", action="store_true", default=False,
+                   help="Evaluate frozen backbone on each domain before adaptation")
 
     # misc
     p.add_argument("--seed", type=int, default=2025)
