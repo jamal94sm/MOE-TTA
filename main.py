@@ -267,11 +267,11 @@ def adapt(cfg):
                 kd_loss_sum += batch_kd_loss * B
 
                 # ─── PLloss circuit breaker ───────────────────────────
-                # If PLloss spikes > 2× running average → drop PL for this batch
+                # If PLloss spikes > 5× running average → drop PL for this batch
                 use_pl = True
                 if len(pl_loss_history) >= 5 and batch_pl_loss > 0:
                     running_avg = sum(pl_loss_history) / len(pl_loss_history)
-                    if running_avg > 0 and batch_pl_loss > 2.0 * running_avg:
+                    if running_avg > 0 and batch_pl_loss > 5.0 * running_avg:
                         use_pl = False
                         pl_was_dropped = True
                         pl_dropped_count += 1
