@@ -117,12 +117,15 @@ def get_cfg(args=None):
     #   - Frozen backbone (always available)
     #   - Expert 0 through k-1 (each with the shared expert at their time)
     #
-    # Two supervision signals are generated:
-    #   1. Hard PL: cross-entropy on samples where all teachers agree
-    #   2. Soft KD: KL divergence from student to teacher ensemble distribution
+    # Pseudo-label supervision: backbone + previous experts generate
+    # labels for the current expert via group consensus.
     #
-    # Total loss = ent_loss + pl_lambda * pl_loss + kd_lambda * kd_loss
-    #              + div_lambda * div_loss
+    # Two modes:
+    #   Hard PL: cross-entropy with argmax class (one-hot target)
+    #   Soft PL: cross-entropy with teacher's full distribution
+    #            sharpened by temperature (lower T = sharper)
+    #
+    # Total loss = ent_loss + pl_lambda * pl_loss + div_lambda * div_loss
 
     p.add_argument("--use_pseudo_labels", action="store_true", default=False,
                    help="Enable cross-expert pseudo-label supervision")
@@ -130,14 +133,12 @@ def get_cfg(args=None):
                    action="store_false")
 
     p.add_argument("--pl_lambda", type=float, default=0.5,
-                   help="Weight for hard pseudo-label cross-entropy loss. "
-                        "Higher = stronger supervision from agreed labels. "
+                   help="Weight for pseudo-label loss. "
                         "Recommended: 0.3-1.0")
 
     p.add_argument("--pl_threshold", type=float, default=0.9,
                    help="Confidence threshold for pseudo-label acceptance. "
                         "A voter's prediction counts only if max(softmax) > this. "
-                        "Higher = fewer but more reliable pseudo-labels. "
                         "Recommended: 0.85-0.95")
 
     p.add_argument("--pl_agreement", type=float, default=0.8,
@@ -146,16 +147,19 @@ def get_cfg(args=None):
                         "0.5 = simple majority. "
                         "Recommended: 0.8 (80%% of voters)")
 
-    p.add_argument("--kd_lambda", type=float, default=0.5,
-                   help="Weight for soft knowledge distillation loss. "
-                        "KL divergence from current expert to teacher ensemble. "
-                        "0 = disabled (hard PL only). "
-                        "Recommended: 0.3-1.0")
+    p.add_argument("--pl_soft", action="store_true", default=False,
+                   help="Use soft pseudo-labels (teacher distribution) instead "
+                        "of hard (argmax one-hot). Soft PL transfers inter-class "
+                        "relationships but gives weaker directional signal.")
+    p.add_argument("--pl_hard", dest="pl_soft", action="store_false",
+                   help="Use hard pseudo-labels (default)")
 
-    p.add_argument("--kd_temperature", type=float, default=1.0,
-                   help="Temperature for KD softmax. Higher = softer distributions, "
-                        "transfers more inter-class relationships. "
-                        "1.0 = standard softmax. Recommended: 1.5-3.0")
+    p.add_argument("--pl_sharpness", type=float, default=0.5,
+                   help="Temperature for soft pseudo-labels. Controls how peaked "
+                        "the teacher distribution is. Lower = sharper (closer to "
+                        "hard labels). Higher = softer (more inter-class info). "
+                        "0.1 = nearly hard. 1.0 = standard softmax. 2.0 = very soft. "
+                        "Only used when --pl_soft is set. Recommended: 0.3-1.0")
 
     p.add_argument("--pl_warmup", type=int, default=100,
                    help="Number of batches after a new domain is detected before "
@@ -165,7 +169,7 @@ def get_cfg(args=None):
                         "supervision. 0 = no warmup. Recommended: 30-100")
 
     # ─── Teacher selection for PL/KD ───
-    p.add_argument("--fdd_include_threshold", type=float, default=1.0,
+    p.add_argument("--fdd_include_threshold", type=float, default=2.0,
                    help="Include previous expert as teacher only if its FDD domain "
                         "distance from the current batch < this threshold. "
                         "Stricter than τ=1.5 (new-domain detection). "
