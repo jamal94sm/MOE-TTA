@@ -1,10 +1,10 @@
 """
-main.py — Complete CTTA adaptation loop for the AAAI 2026 paper.
+main.py — CTTA adaptation loop.
 
-v5: FDD distance-based teacher gating + oracle domain mode.
-    - FDD distances determine which experts teach which domains
-    - Oracle mode assigns corruptions to 4 known families
-    - Warmup phase, group consensus, filtered KD
+v6: PLloss circuit breaker + teacher composition tracking.
+    - If PLloss spikes > 2× running average → drop PL term for that batch
+    - Print columns show teacher composition and FDD distances
+    - Shared expert included as teacher candidate
 """
 
 import os, sys, math, time, json, random
@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
-from collections import Counter
+from collections import Counter, deque
 
 from config import get_cfg, ORACLE_LOOKUP
 from model import build_model
@@ -50,7 +50,7 @@ def adapt(cfg):
     print(f"  AAAI 2026: Shared & Domain Self-Adaptive Experts with FDD")
     print(f"  Dataset: {cfg.dataset} | LR: {cfg.lr} | BS: {cfg.batch_size}")
     if cfg.oracle_domains:
-        print(f"  Domain detection: ORACLE (4 families: noise, blur, weather, digital)")
+        print(f"  Domain detection: ORACLE (4 families)")
     else:
         print(f"  Domain detection: FDD (online, τ={cfg.fdd_threshold})")
     print(f"{'='*90}\n")
@@ -78,6 +78,7 @@ def adapt(cfg):
               f"pl_threshold={cfg.pl_threshold}, pl_agreement={cfg.pl_agreement}, "
               f"kd_temperature={cfg.kd_temperature}, pl_warmup={cfg.pl_warmup}")
         print(f"[PL/KD] Teacher gating: fdd_include_threshold={cfg.fdd_include_threshold}")
+        print(f"[PL/KD] PLloss circuit breaker: 2× running avg over 20 batches")
     else:
         print(f"[PL/KD] Disabled")
 
@@ -109,7 +110,11 @@ def adapt(cfg):
     total_correct = total_samples = 0
     current_fdd_domain = -1; global_step = 0
     batches_since_new_domain = 0
-    known_oracle_domains = set()  # track which oracle groups have been seen
+    known_oracle_domains = set()
+    fdd_distances = {}
+
+    # PLloss circuit breaker: running average over last 20 batches
+    pl_loss_history = deque(maxlen=20)
 
     imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -119,7 +124,7 @@ def adapt(cfg):
            f"{'top%':>4} │{'H_cor':>5} │{'H_wrg':>5}")
     if cfg.use_pseudo_labels:
         hdr += (f" │{'PL%':>4} │{'PLac':>4} │{'T_er':>4} │"
-                f"{'KD%':>4} │{'excl':>4} │{'PLls':>6} │{'KDls':>6} │{'phase':>6}")
+                f"{'PLls':>6} │{'KDls':>6} │{'teach':>12} │{'dists':>16} │{'phase':>5}")
 
     for seg_idx, (domain_name, loader) in enumerate(domain_sequence):
         seg_correct = seg_total = 0; seg_loss_sum = 0.0
@@ -130,55 +135,45 @@ def adapt(cfg):
         pl_loss_sum = kd_loss_sum = 0.0
         pl_correct_sum = teacher_correct_sum = teacher_total = 0
         warmup_batches_used = 0
+        pl_dropped_count = 0
 
-        print(f"\n{'─'*90}")
+        print(f"\n{'─'*120}")
         print(f"  [{seg_idx+1}/{len(domain_sequence)}] {domain_name} "
               f"({len(loader.dataset)} samples, {n_batches} batches)")
-        print(f"{'─'*90}")
+        print(f"{'─'*120}")
         print(hdr)
 
         for batch_idx, (images, labels) in enumerate(loader):
             images = images.to(cfg.device); labels = labels.to(cfg.device)
             B = images.shape[0]
-            mean = imagenet_mean.to(cfg.device); std = imagenet_std.to(cfg.device)
-            raw_images = images * std + mean
+            mean_t = imagenet_mean.to(cfg.device); std_t = imagenet_std.to(cfg.device)
+            raw_images = images * std_t + mean_t
 
-            # ─── Domain detection: Oracle or FDD ───
+            # ─── Domain detection ───
             if cfg.oracle_domains:
-                # Oracle: lookup corruption → group
                 corruption_base = domain_name.rsplit("_R", 1)[0]
-                if corruption_base in ORACLE_LOOKUP:
-                    group_name, group_id = ORACLE_LOOKUP[corruption_base]
-                else:
-                    group_name, group_id = "unknown", 0
-
+                group_name, group_id = ORACLE_LOOKUP.get(corruption_base, ("unk", 0))
                 is_new = (group_id not in known_oracle_domains)
                 fdd_domain_id = group_id
-
-                if is_new:
-                    known_oracle_domains.add(group_id)
-
-                # still run FDD for distance computation (teacher gating)
+                if is_new: known_oracle_domains.add(group_id)
                 if batch_idx == 0:
                     fdd_distances = fdd.distances_to_all_domains(raw_images)
-                    # also feed FDD so it builds domain stats for distance queries
                     fdd.detect_domain(raw_images)
             else:
-                # FDD: online detection
                 fdd_domain_id, is_new = fdd.detect_domain(raw_images)
-                # get distances for teacher gating (computed from same batch)
                 fdd_distances = fdd.distances_to_all_domains(raw_images)
 
-            # ─── Expand or activate expert ───
+            # ─── Expand or activate ───
             if is_new and batch_idx == 0:
                 expert_id = model.expand_domain()
                 model.set_active_domain(expert_id)
                 current_fdd_domain = fdd_domain_id
                 domain_map[fdd_domain_id] = [domain_name]
                 batches_since_new_domain = 0
-                label = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
-                print(f"  >>> New domain {fdd_domain_id} ({label}) → expert {expert_id} "
-                      f"(warmup for {cfg.pl_warmup} batches)")
+                pl_loss_history.clear()  # reset circuit breaker for new domain
+                lbl = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
+                print(f"  >>> New domain {fdd_domain_id} ({lbl}) → expert {expert_id} "
+                      f"(warmup {cfg.pl_warmup})")
                 if optimizer is None:
                     optimizer = Adam(model.get_trainable_params(),
                                     lr=cfg.lr, betas=(0.9, 0.999),
@@ -192,17 +187,13 @@ def adapt(cfg):
                         optimizer.add_param_group({
                             'params': new_params, 'lr': cfg.lr,
                             'betas': (0.9, 0.999), 'weight_decay': cfg.weight_decay})
-
             elif fdd_domain_id != current_fdd_domain and batch_idx == 0:
                 model.set_active_domain(fdd_domain_id)
                 current_fdd_domain = fdd_domain_id
-                if fdd_domain_id in domain_map:
-                    domain_map[fdd_domain_id].append(domain_name)
-                else:
-                    domain_map[fdd_domain_id] = [domain_name]
-                label = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
-                print(f"  >>> Matched domain {fdd_domain_id} ({label}) → "
-                      f"expert {fdd_domain_id}")
+                domain_map.setdefault(fdd_domain_id, []).append(domain_name)
+                pl_loss_history.clear()
+                lbl = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
+                print(f"  >>> Matched domain {fdd_domain_id} ({lbl}) → expert {fdd_domain_id}")
 
             # ─── Forward ───
             logits = model(images)
@@ -235,7 +226,9 @@ def adapt(cfg):
 
             batch_pl_loss = batch_kd_loss = 0.0
             batch_pl_rate = batch_pl_acc = batch_teacher_err = 0.0
-            batch_kd_rate = batch_excl = 0.0
+            batch_teach_str = "--"
+            batch_dist_str = "--"
+            pl_was_dropped = False
 
             in_warmup = (cfg.use_pseudo_labels and
                          batches_since_new_domain < cfg.pl_warmup)
@@ -252,15 +245,17 @@ def adapt(cfg):
                 batch_pl_loss = loss_stats["pl_loss"]
                 batch_kd_loss = loss_stats["kd_loss"]
                 batch_pl_rate = pl_stats["agreement_rate"]
-                batch_kd_rate = 100.0 * loss_stats["kd_samples"] / B
-                batch_excl = pl_stats.get("experts_excluded", 0)
+                batch_teach_str = pl_stats["teach_str"]
+                batch_dist_str = pl_stats["dist_str"]
 
+                # PL accuracy diagnostic
                 if pl_mask.sum() > 0:
                     batch_pl_acc = (pseudo_labels_t[pl_mask] == labels[pl_mask]).float().mean().item() * 100
                     pl_correct_sum += (pseudo_labels_t[pl_mask] == labels[pl_mask]).sum().item()
                 else:
                     batch_pl_acc = -1
 
+                # teacher error
                 teacher_pred = pl_stats["teacher_pred"]
                 t_correct = (teacher_pred == labels).sum().item()
                 batch_teacher_err = 100.0 * (1 - t_correct / B)
@@ -271,15 +266,31 @@ def adapt(cfg):
                 pl_loss_sum += batch_pl_loss * B
                 kd_loss_sum += batch_kd_loss * B
 
+                # ─── PLloss circuit breaker ───────────────────────────
+                # If PLloss spikes > 2× running average → drop PL for this batch
+                use_pl = True
+                if len(pl_loss_history) >= 5 and batch_pl_loss > 0:
+                    running_avg = sum(pl_loss_history) / len(pl_loss_history)
+                    if running_avg > 0 and batch_pl_loss > 2.0 * running_avg:
+                        use_pl = False
+                        pl_was_dropped = True
+                        pl_dropped_count += 1
+                        phase = "drop"
+
+                # Only track PLloss from healthy batches (not dropped)
+                # so running average stays calibrated to normal values
+                if use_pl and batch_pl_loss > 0:
+                    pl_loss_history.append(batch_pl_loss)
+
+                # combine losses
                 total_loss = ent_loss
-                if cfg.pl_lambda > 0 and pl_loss.item() > 0:
+                if use_pl and cfg.pl_lambda > 0 and pl_loss.item() > 0:
                     total_loss = total_loss + cfg.pl_lambda * pl_loss
-                if cfg.kd_lambda > 0 and kd_loss.item() > 0:
+                if use_pl and cfg.kd_lambda > 0 and kd_loss.item() > 0:
                     total_loss = total_loss + cfg.kd_lambda * kd_loss
             else:
                 total_loss = ent_loss
-                if in_warmup:
-                    warmup_batches_used += 1
+                if in_warmup: warmup_batches_used += 1
 
             seg_loss_sum += total_loss.item() * B
 
@@ -310,14 +321,16 @@ def adapt(cfg):
                         f"{pass_rate:5.1f} │{top_pct:4.0f} │{hc:>5s} │{hw:>5s}")
                 if cfg.use_pseudo_labels:
                     if in_warmup:
-                        line += (f" │  -- │  -- │  -- │  -- │  -- │"
-                                 f"   -- │   -- │ {'warm':>5s}")
+                        line += (f" │  -- │  -- │  -- │"
+                                 f"   -- │   -- │{'--':>12s} │{'--':>16s} │ {'warm':>5s}")
                     else:
                         pla = f"{batch_pl_acc:.0f}" if batch_pl_acc > 0 else " --"
+                        dr = "!" if pl_was_dropped else ""
                         line += (f" │{batch_pl_rate:4.0f} │{pla:>4s} │"
-                                 f"{batch_teacher_err:4.0f} │{batch_kd_rate:4.0f} │"
-                                 f"{batch_excl:4.0f} │{batch_pl_loss:6.3f} │"
-                                 f"{batch_kd_loss:6.3f} │ {'pl+kd':>5s}")
+                                 f"{batch_teacher_err:4.0f} │"
+                                 f"{batch_pl_loss:6.3f}{dr} │{batch_kd_loss:6.3f} │"
+                                 f"{batch_teach_str:>12s} │{batch_dist_str:>16s} │"
+                                 f" {phase:>5s}")
                 print(line)
 
             total_correct += correct; total_samples += B; global_step += 1
@@ -345,9 +358,8 @@ def adapt(cfg):
         baseline_err = baseline_errors.get(domain_name, None)
         print(f"\n  ┌── SUMMARY: {domain_name}")
         if cfg.oracle_domains:
-            corruption_base = domain_name.rsplit("_R", 1)[0]
-            gn = ORACLE_LOOKUP.get(corruption_base, ("?", -1))[0]
-            print(f"  │ Oracle group: {gn} (domain {current_fdd_domain})")
+            cb = domain_name.rsplit("_R", 1)[0]
+            print(f"  │ Oracle group: {ORACLE_LOOKUP.get(cb, ('?',-1))[0]} (domain {current_fdd_domain})")
         if baseline_err is not None:
             imp = baseline_err - avg_err
             print(f"  │ Backbone Error:  {baseline_err:.1f}%")
@@ -362,17 +374,20 @@ def adapt(cfg):
               f"Updates: {updates_applied}/{updates_applied + updates_skipped} | "
               f"Time: {elapsed:.1f}s")
         if cfg.use_pseudo_labels:
-            pl_acc_avg = 100.0 * pl_correct_sum / max(pl_total_agreed, 1) if pl_total_agreed > 0 else 0.0
-            teacher_err_avg = 100.0 * (1 - teacher_correct_sum / max(teacher_total, 1)) if teacher_total > 0 else 0.0
-            pl_avg_rate = 100.0 * pl_total_agreed / max(pl_total_samples, 1) if pl_total_samples > 0 else 0.0
+            pl_acc_avg = 100.0 * pl_correct_sum / max(pl_total_agreed, 1) if pl_total_agreed > 0 else 0
+            teacher_err_avg = 100.0 * (1 - teacher_correct_sum / max(teacher_total, 1)) if teacher_total > 0 else 0
+            pl_avg_rate = 100.0 * pl_total_agreed / max(pl_total_samples, 1) if pl_total_samples > 0 else 0
             print(f"  │ Warmup: {warmup_batches_used} batches, "
                   f"then PL/KD for {n_batches - warmup_batches_used}")
-            print(f"  │ PL: {pl_avg_rate:.1f}% agreed, "
-                  f"{pl_acc_avg:.1f}% correct | "
-                  f"Teacher err: {teacher_err_avg:.1f}% | "
-                  f"voters={current_fdd_domain + 1}")
+            print(f"  │ PL: {pl_avg_rate:.1f}% agreed, {pl_acc_avg:.1f}% correct | "
+                  f"Teacher err: {teacher_err_avg:.1f}%")
             print(f"  │ PL_loss={pl_loss_sum / max(pl_total_samples, 1):.4f} | "
-                  f"KD_loss={kd_loss_sum / max(pl_total_samples, 1):.4f}")
+                  f"KD_loss={kd_loss_sum / max(pl_total_samples, 1):.4f} | "
+                  f"PL dropped: {pl_dropped_count} batches")
+            # FDD distances from this domain to all others
+            if fdd_distances:
+                dist_parts = [f"d{k}={v:.2f}" for k, v in sorted(fdd_distances.items())]
+                print(f"  │ FDD distances: {', '.join(dist_parts)}")
         print(f"  │ Step: {global_step}/{total_batches}")
         if takeover_batch is not None:
             print(f"  │ ⚠ TAKEOVER: cls{top_class_history[takeover_batch][0]} at batch {takeover_batch}")
