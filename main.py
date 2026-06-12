@@ -150,30 +150,29 @@ def adapt(cfg):
             mean_t = imagenet_mean.to(cfg.device); std_t = imagenet_std.to(cfg.device)
             raw_images = images * std_t + mean_t
 
-            # ─── Domain detection ───
+            # ─── Domain detection (every batch — shifts can happen anytime) ───
             if cfg.oracle_domains:
                 corruption_base = domain_name.rsplit("_R", 1)[0]
                 group_name, group_id = ORACLE_LOOKUP.get(corruption_base, ("unk", 0))
                 is_new = (group_id not in known_oracle_domains)
                 fdd_domain_id = group_id
                 if is_new: known_oracle_domains.add(group_id)
-                if batch_idx == 0:
-                    fdd_distances = fdd.distances_to_all_domains(raw_images)
-                    fdd.detect_domain(raw_images)
+                fdd_distances = fdd.distances_to_all_domains(raw_images)
+                fdd.detect_domain(raw_images)  # update FDD stats
             else:
                 fdd_domain_id, is_new = fdd.detect_domain(raw_images)
                 fdd_distances = fdd.distances_to_all_domains(raw_images)
 
-            # ─── Expand or activate ───
-            if is_new and batch_idx == 0:
+            # ─── Expand or activate (can happen on any batch) ───
+            if is_new:
                 expert_id = model.expand_domain()
                 model.set_active_domain(expert_id)
                 current_fdd_domain = fdd_domain_id
-                domain_map[fdd_domain_id] = [domain_name]
+                domain_map.setdefault(fdd_domain_id, []).append(domain_name)
                 batches_since_new_domain = 0
                 pl_loss_history.clear()
                 lbl = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
-                print(f"  >>> New domain {fdd_domain_id} ({lbl}) "
+                print(f"  >>> [bat {batch_idx}] New domain {fdd_domain_id} ({lbl}) "
                       f"→ expert e{expert_id} (warmup {cfg.pl_warmup})")
                 if optimizer is None:
                     optimizer = Adam(model.get_trainable_params(),
@@ -188,13 +187,14 @@ def adapt(cfg):
                         optimizer.add_param_group({
                             'params': new_params, 'lr': cfg.lr,
                             'betas': (0.9, 0.999), 'weight_decay': cfg.weight_decay})
-            elif fdd_domain_id != current_fdd_domain and batch_idx == 0:
+            elif fdd_domain_id != current_fdd_domain:
                 model.set_active_domain(fdd_domain_id)
                 current_fdd_domain = fdd_domain_id
                 domain_map.setdefault(fdd_domain_id, []).append(domain_name)
+                batches_since_new_domain = 0
                 pl_loss_history.clear()
                 lbl = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
-                print(f"  >>> Matched domain {fdd_domain_id} ({lbl}) "
+                print(f"  >>> [bat {batch_idx}] Switched to domain {fdd_domain_id} ({lbl}) "
                       f"→ expert e{fdd_domain_id}")
 
             # ─── Forward ───
