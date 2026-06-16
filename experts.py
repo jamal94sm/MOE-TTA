@@ -76,8 +76,6 @@ class DualBranchExpert(nn.Module):
         self.use_shared = use_shared
 
         self.domain_rank = domain_rank
-        self.vida_domain = getattr(cfg, 'vida_domain', False) if cfg is not None else False
-        self.domain_high_rank = getattr(cfg, 'domain_high_rank', 128) if cfg is not None else 128
 
         # shared expert branch (Eq. 3)
         self.shared_moe = MoEModule(dim, shared_rank, num_experts)
