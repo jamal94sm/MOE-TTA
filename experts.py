@@ -71,10 +71,13 @@ class DualBranchExpert(nn.Module):
              num_experts=2, fusion_lambda=0.5, use_shared=True):
         super().__init__()
         self.dim = dim
-        self.domain_rank = domain_rank
         self.num_experts = num_experts
         self.fusion_lambda = fusion_lambda
         self.use_shared = use_shared
+
+        self.domain_rank = domain_rank
+        self.vida_domain = getattr(cfg, 'vida_domain', False) if cfg is not None else False
+        self.domain_high_rank = getattr(cfg, 'domain_high_rank', 128) if cfg is not None else 128
 
         # shared expert branch (Eq. 3)
         self.shared_moe = MoEModule(dim, shared_rank, num_experts)
@@ -95,7 +98,10 @@ class DualBranchExpert(nn.Module):
         Add a new domain self-adaptive MoE module.
         Returns the new domain index.
         """
-        new_moe = MoEModule(self.dim, self.domain_rank, self.num_experts)
+
+        effective_rank = self.domain_high_rank if self.vida_domain else self.domain_rank
+        new_moe = MoEModule(dim=self.dim, rank=effective_rank,
+                             num_experts=self.num_experts)
         # move to same device as shared_moe
         device = next(self.shared_moe.parameters()).device
         new_moe = new_moe.to(device)
