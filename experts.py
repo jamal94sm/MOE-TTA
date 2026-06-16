@@ -97,7 +97,6 @@ class DualBranchExpert(nn.Module):
         Returns the new domain index.
         """
 
-        effective_rank = self.domain_high_rank if self.vida_domain else self.domain_rank
         new_moe = MoEModule(dim=self.dim, rank=self.domain_rank, 
                      num_experts=self.num_experts)
         # move to same device as shared_moe
