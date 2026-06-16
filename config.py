@@ -168,13 +168,17 @@ def get_cfg(args=None):
                         "learn basic domain features before receiving cross-expert "
                         "supervision. 0 = no warmup. Recommended: 30-100")
 
-    # ─── Teacher selection for PL/KD ───
+    # ─── Teacher selection for PL ───
     p.add_argument("--fdd_include_threshold", type=float, default=1.0,
                    help="Include previous expert as teacher only if its FDD domain "
                         "distance from the current batch < this threshold. "
-                        "Stricter than τ=1.5 (new-domain detection). "
-                        "0 = backbone-only teacher (no cross-expert). "
                         "Recommended: 0.8-1.2")
+
+    p.add_argument("--backbone_only_teacher", action="store_true", default=False,
+                   help="Use ONLY the frozen backbone as teacher for PL. "
+                        "Ignores all previous experts. Best baseline so far.")
+    p.add_argument("--no_backbone_only_teacher", dest="backbone_only_teacher",
+                   action="store_false")
 
     # ─── Oracle domain detection ───
     # Assigns corruptions to 4 known families instead of FDD.
