@@ -47,6 +47,7 @@ class ExpertViT(nn.Module):
 
         blocks = self._get_blocks()
         for block in blocks:
+            effective_domain_rank = cfg.domain_high_rank if cfg.vida_domain else cfg.domain_rank
             expert = DualBranchExpert(
                 dim=dim,
                 shared_rank=cfg.shared_rank,
