@@ -26,6 +26,36 @@ def get_teacher_signals(model, images, active_domain, cfg,
     agreement_ratio = cfg.pl_agreement
     include_thresh = cfg.fdd_include_threshold
 
+    # ─── Backbone-only mode (best baseline) ───────────────────────────
+    if cfg.backbone_only_teacher:
+        bb_logits = model.backbone(images)
+        bb_probs = F.softmax(bb_logits, dim=-1)
+        bb_conf, bb_pred = bb_probs.max(dim=-1)
+
+        pl_mask = bb_conf > threshold
+        pseudo_labels = bb_pred
+
+        T = cfg.pl_sharpness if cfg.pl_soft else 1.0
+        teacher_probs = F.softmax(bb_logits / T, dim=-1)
+
+        if fdd_distances:
+            dist_str = "/".join(f"d{k}={v:.1f}" for k, v in sorted(fdd_distances.items()))
+        else:
+            dist_str = "--"
+
+        stats = {
+            "num_voters": 1,
+            "num_agreed": pl_mask.sum().item(),
+            "agreement_rate": pl_mask.float().mean().item() * 100,
+            "experts_excluded": 0, "experts_included": 0,
+            "bb_pred": bb_pred, "teacher_pred": bb_pred,
+            "teach_str": "bb", "dist_str": dist_str,
+            "excluded_details": [],
+        }
+        return pseudo_labels, pl_mask, teacher_probs, stats
+
+    # ─── Full mode: backbone + FDD-gated previous experts ─────────────
+
     voter_names = []
     all_preds = []
     all_confs = []
