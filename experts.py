@@ -98,8 +98,8 @@ class DualBranchExpert(nn.Module):
         """
 
         effective_rank = self.domain_high_rank if self.vida_domain else self.domain_rank
-        new_moe = MoEModule(dim=self.dim, rank=effective_rank,
-                             num_experts=self.num_experts)
+        new_moe = MoEModule(dim=self.dim, rank=self.domain_rank, 
+                     num_experts=self.num_experts)
         # move to same device as shared_moe
         device = next(self.shared_moe.parameters()).device
         new_moe = new_moe.to(device)
