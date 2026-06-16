@@ -76,6 +76,22 @@ def get_cfg(args=None):
     p.add_argument("--no_shared_expert", dest="use_shared_expert",
                    action="store_false")
 
+    # ─── ViDA-style high-rank domain experts ───
+    # Standard: both shared (rank 32) and domain (rank 16) are low-rank.
+    # ViDA mode: shared stays low-rank, domain experts use high-rank
+    # adapters with much larger bottleneck for greater capacity.
+    # Rationale: domain-specific features need more capacity to capture
+    # fine-grained corruption patterns, while shared features compress well.
+    p.add_argument("--vida_domain", action="store_true", default=False,
+                   help="Use high-rank domain experts (ViDA-style). "
+                        "Shared expert stays low-rank (shared_rank). "
+                        "Domain experts use domain_high_rank instead of domain_rank.")
+    p.add_argument("--no_vida_domain", dest="vida_domain", action="store_false")
+    p.add_argument("--domain_high_rank", type=int, default=128,
+                   help="Bottleneck dim for high-rank domain experts when "
+                        "--vida_domain is set. Higher = more capacity. "
+                        "Recommended: 64-256. Paper ViDA uses 256.")
+
     # FDD (Section 3.3)
     p.add_argument("--fdd_freq_radius", type=int, default=16,
                    help="l: frequency radius for low-freq crop")
