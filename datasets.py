@@ -71,6 +71,8 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
                              std=[0.229, 0.224, 0.225]),
     ])
     '''
+
+    '''
     # use timm's recommended transform for this specific checkpoint
     model = timm.create_model(backbone_name, pretrained=False)
     data_cfg = timm.data.resolve_model_data_config(model)
@@ -86,7 +88,27 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
                             num_workers=num_workers, pin_memory=True,
                             drop_last=False)
         loaders.append((corruption, loader))
+    '''
 
+    # 2. Replicate the baseline's 'Res256Crop224' exactly using Bicubic interpolation:
+    transform = transforms.Compose([
+        transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    loaders = []
+    for corruption in run_corruptions:
+        ds = ImageNetCDataset(data_dir, corruption, severity, transform)
+        # 3. Change shuffle back to False for stable evaluation tracking
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False, 
+                            num_workers=num_workers, pin_memory=True,
+                            drop_last=False)
+        loaders.append((corruption, loader))
+
+    
     return loaders
 
 
