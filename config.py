@@ -58,7 +58,8 @@ def get_cfg(args=None):
                    help="Rounds for CRS benchmark")
 
     # backbone
-    p.add_argument("--backbone", default="vit_base_patch16_224")
+    # vit_base_patch16_224.orig_in21k_ft_in1k, vit_base_patch16_224
+    p.add_argument("--backbone", default="vit_base_patch16_224.orig_in21k_ft_in1k")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--num_classes", type=int, default=1000)
 
