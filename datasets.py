@@ -91,9 +91,13 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
     '''
 
     # 2. Replicate the baseline's 'Res256Crop224' exactly using Bicubic interpolation:
-    transform = transforms.Compose([transforms.Resize(256),
-                                         transforms.CenterCrop(224),
-                                         transforms.ToTensor()])
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5]),
+    ])
 
     loaders = []
     for corruption in run_corruptions:
