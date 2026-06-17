@@ -30,7 +30,7 @@ class ExpertViT(nn.Module):
 
         # load pretrained backbone
         self.backbone = timm.create_model(
-            cfg.backbone, pretrained=True, num_classes=cfg.num_classes)
+            cfg.backbone, pretrained=True)
 
         # freeze entire backbone
         for p in self.backbone.parameters():
